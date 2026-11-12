@@ -3,7 +3,9 @@ mod cpu;
 
 use std::env;
 
-use audio_verifier_enclave::{MAX_BODY_BYTES_ENV, app, max_body_bytes, server_config};
+use audio_verifier_enclave::{
+    MAX_BODY_BYTES_ENV, Resources, app, max_body_bytes, measure_concurrency, server_config,
+};
 use nautilus::NautilusContext;
 
 #[cfg(not(feature = "dev"))]
@@ -40,8 +42,19 @@ async fn serve() -> anyhow::Result<()> {
     println!("[nautilus] public key: {}", ctx.public_key_hex());
     println!("[nautilus] address:    {}", ctx.sui_address());
     let config = server_config(max_body_bytes);
-    let app = app(ctx, config.clone())?;
+    let resources = Resources::detect();
+    let measure_concurrent = measure_concurrency(resources, max_body_bytes as u64);
+    let app = app(ctx, config.clone(), measure_concurrent)?;
     println!("[server] max body bytes: {max_body_bytes}");
+    println!(
+        "[server] /v1/measure jobs: {measure_concurrent} ({} vCPUs, MemTotal {} MiB)",
+        resources
+            .cpus
+            .map_or_else(|| "unknown".into(), |cpus| cpus.to_string()),
+        resources
+            .memory_bytes
+            .map_or_else(|| "unknown".into(), |bytes| (bytes >> 20).to_string()),
+    );
     #[cfg(feature = "dev")]
     {
         println!("[server] listening on http://{LISTEN_ADDR}");

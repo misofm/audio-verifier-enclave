@@ -1,3 +1,4 @@
+mod sizing;
 mod stream;
 
 use std::time::Duration;
@@ -9,6 +10,10 @@ use nautilus::{
 };
 use serde::{Deserialize, Serialize};
 
+pub use sizing::{
+    MEASURE_JOB_BYTES, PROCESS_RESERVE_BYTES, Resources, measure_concurrency, mem_total,
+    process_data_bytes,
+};
 pub use stream::{StreamConfig, measure_routes};
 
 /// Intent of the signed `IntentMessage<AudioPayload>`, verified on chain by
@@ -42,10 +47,6 @@ pub const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Closes a connection that does no I/O for this long outside a handler.
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Concurrent `/v1/measure` jobs, besides the one `/process_data` upload; more get HTTP 429.
-/// Each holds about 1 MiB of the file and a decoder and hasher thread.
-pub const MEASURE_MAX_CONCURRENT: usize = 2;
 
 /// A `/v1/measure` body that delivers nothing for this long is abandoned.
 pub const MEASURE_CHUNK_TIMEOUT: Duration = Duration::from_secs(30);
@@ -213,11 +214,12 @@ pub fn server_config(max_body_bytes: usize) -> ServerConfig {
     }
 }
 
-/// Limits of `/v1/measure` for files of up to `max_file_bytes`.
-pub fn stream_config(max_file_bytes: usize) -> StreamConfig {
+/// Limits of `/v1/measure` for files of up to `max_file_bytes` and `max_concurrent` jobs at once,
+/// besides the one `/process_data` upload; [`measure_concurrency`] sizes them to the enclave.
+pub fn stream_config(max_file_bytes: usize, max_concurrent: usize) -> StreamConfig {
     StreamConfig {
         max_file_bytes: max_file_bytes as u64,
-        max_concurrent: MEASURE_MAX_CONCURRENT,
+        max_concurrent,
         chunk_timeout: MEASURE_CHUNK_TIMEOUT,
         request_timeout: MEASURE_REQUEST_TIMEOUT,
     }
@@ -225,9 +227,14 @@ pub fn stream_config(max_file_bytes: usize) -> StreamConfig {
 
 /// Builds the enclave router around an injected context: Nautilus's `/health_check`,
 /// `/attestation` and buffered `/process_data`, and the streaming `/v1/measure`, whose file limit
-/// is `config.max_body_bytes`.
-pub fn app(ctx: NautilusContext, config: ServerConfig) -> Result<Router, ConfigError> {
-    let measure = measure_routes(ctx.clone(), stream_config(config.max_body_bytes));
+/// is `config.max_body_bytes` and which runs up to `measure_concurrent` jobs at once.
+pub fn app(
+    ctx: NautilusContext,
+    config: ServerConfig,
+    measure_concurrent: usize,
+) -> Result<Router, ConfigError> {
+    let stream = stream_config(config.max_body_bytes, measure_concurrent);
+    let measure = measure_routes(ctx.clone(), stream);
     let router = nautilus::router(ctx, config, |bytes: Bytes, ctx: &NautilusContext| {
         process(&bytes, ctx)
     })?;

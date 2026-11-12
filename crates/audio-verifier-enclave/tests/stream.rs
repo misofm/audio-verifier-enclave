@@ -3,8 +3,8 @@ use std::{path::Path, time::Duration};
 use audio_verifier::{AudioPayload, measure};
 use audio_verifier_enclave::{
     AUDIO_INTENT, DEFAULT_MAX_BODY_BYTES, MASTER_FILE_INTENT, MEASURE_CHUNK_TIMEOUT,
-    MEASURE_MAX_CONCURRENT, MEASURE_REQUEST_TIMEOUT, MasterFilePayload, MeasureResponse,
-    ProcessDataResponse, StreamConfig, app, measure_routes, server_config, stream_config,
+    MEASURE_REQUEST_TIMEOUT, MasterFilePayload, MeasureResponse, ProcessDataResponse, StreamConfig,
+    app, measure_routes, server_config, stream_config,
 };
 use axum::{
     Router,
@@ -85,8 +85,11 @@ fn open_body(length: usize) -> (Request<Body>, mpsc::Sender<Chunk>) {
     (request(Body::from_stream(stream), Some(length)), sender)
 }
 
+/// `/v1/measure` jobs the test routers run at once.
+const CONCURRENT: usize = 2;
+
 fn router(limit: usize) -> Router {
-    app(context(), server_config(limit)).expect("config")
+    app(context(), server_config(limit), CONCURRENT).expect("config")
 }
 
 async fn json(response: Response<Body>) -> (StatusCode, serde_json::Value) {
@@ -142,7 +145,12 @@ fn verify(ctx: &NautilusContext, body: &MeasureResponse, audio: &AudioPayload, f
 #[tokio::test]
 async fn streamed_file_is_signed_twice_with_one_timestamp() {
     let ctx = context();
-    let router = app(ctx.clone(), server_config(DEFAULT_MAX_BODY_BYTES)).expect("config");
+    let router = app(
+        ctx.clone(),
+        server_config(DEFAULT_MAX_BODY_BYTES),
+        CONCURRENT,
+    )
+    .expect("config");
     let bytes = fixture();
     let measured = measure(&bytes).expect("fixture");
     for chunk in [1, 7, 4096, 1 << 20, usize::MAX] {
@@ -189,7 +197,12 @@ async fn streamed_file_is_signed_twice_with_one_timestamp() {
 #[tokio::test]
 async fn tags_are_skipped_on_both_routes() {
     let ctx = context();
-    let router = app(ctx.clone(), server_config(DEFAULT_MAX_BODY_BYTES)).expect("config");
+    let router = app(
+        ctx.clone(),
+        server_config(DEFAULT_MAX_BODY_BYTES),
+        CONCURRENT,
+    )
+    .expect("config");
     let canonical = fixture();
     let tagged = tagged(&canonical);
     let measured = measure(&canonical).expect("fixture");
@@ -320,7 +333,7 @@ async fn concurrent_measurements_are_bounded() {
     let router = router(DEFAULT_MAX_BODY_BYTES);
     let bytes = fixture();
     let mut pending = Vec::new();
-    for _ in 0..MEASURE_MAX_CONCURRENT {
+    for _ in 0..CONCURRENT {
         let (request, sender) = open_body(bytes.len());
         let mut response = Box::pin(router.clone().oneshot(request));
         assert!(futures_util::poll!(&mut response).is_pending());
@@ -413,7 +426,7 @@ async fn nautilus_deadlines_do_not_apply_to_the_stream() {
         body_read_timeout: Duration::from_millis(50),
         ..server_config(DEFAULT_MAX_BODY_BYTES)
     };
-    let router = app(context(), config).expect("config");
+    let router = app(context(), config, CONCURRENT).expect("config");
     let bytes = fixture();
     let (request, sender) = open_body(bytes.len());
     let response = tokio::spawn(router.oneshot(request));
@@ -426,9 +439,9 @@ async fn nautilus_deadlines_do_not_apply_to_the_stream() {
 
 #[test]
 fn stream_limits_follow_the_body_limit() {
-    let config = stream_config(DEFAULT_MAX_BODY_BYTES);
+    let config = stream_config(DEFAULT_MAX_BODY_BYTES, 3);
     assert_eq!(config.max_file_bytes, 256 * 1024 * 1024);
-    assert_eq!(config.max_concurrent, MEASURE_MAX_CONCURRENT);
+    assert_eq!(config.max_concurrent, 3);
     assert_eq!(config.chunk_timeout, MEASURE_CHUNK_TIMEOUT);
     assert_eq!(config.request_timeout, MEASURE_REQUEST_TIMEOUT);
     assert!(config.chunk_timeout < config.request_timeout);

@@ -53,7 +53,7 @@ async fn json(response: Response<Body>) -> serde_json::Value {
 async fn process_data_signs_the_audio() {
     let ctx = context();
     let bytes = fixture();
-    let response = app(ctx.clone(), server_config(DEFAULT_MAX_BODY_BYTES))
+    let response = app(ctx.clone(), server_config(DEFAULT_MAX_BODY_BYTES), 2)
         .expect("config")
         .oneshot(post(Body::from(bytes.clone())))
         .await
@@ -100,7 +100,7 @@ async fn process_data_signs_the_audio() {
 async fn bcs_intent_message_body_is_rejected_unsigned() {
     let audio = measure(&fixture()).expect("fixture");
     let message = intent_message(AUDIO_INTENT, 1_750_000_000_000, &audio).expect("BCS");
-    let response = app(context(), server_config(DEFAULT_MAX_BODY_BYTES))
+    let response = app(context(), server_config(DEFAULT_MAX_BODY_BYTES), 2)
         .expect("config")
         .oneshot(post(Body::from(message)))
         .await
@@ -117,7 +117,7 @@ async fn bcs_intent_message_body_is_rejected_unsigned() {
 async fn invalid_flac_is_rejected() {
     let mut bytes = fixture();
     bytes[30] ^= 1;
-    let response = app(context(), server_config(DEFAULT_MAX_BODY_BYTES))
+    let response = app(context(), server_config(DEFAULT_MAX_BODY_BYTES), 2)
         .expect("config")
         .oneshot(post(Body::from(bytes)))
         .await
@@ -129,7 +129,7 @@ async fn invalid_flac_is_rejected() {
 
 #[tokio::test]
 async fn body_limit_is_enforced() {
-    let response = app(context(), server_config(4))
+    let response = app(context(), server_config(4), 2)
         .expect("config")
         .oneshot(post(Body::from(vec![0u8; 5])))
         .await
@@ -139,7 +139,7 @@ async fn body_limit_is_enforced() {
 
 #[tokio::test]
 async fn second_upload_is_refused_while_one_is_in_flight() {
-    let router: Router = app(context(), server_config(DEFAULT_MAX_BODY_BYTES)).expect("config");
+    let router: Router = app(context(), server_config(DEFAULT_MAX_BODY_BYTES), 2).expect("config");
     let (sender, receiver) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(1);
     let stream = tokio_stream(receiver);
     let mut first = Box::pin(router.clone().oneshot(post(Body::from_stream(stream))));
@@ -168,7 +168,7 @@ async fn second_upload_is_refused_while_one_is_in_flight() {
 #[tokio::test]
 async fn health_check_reports_the_injected_identity() {
     let ctx = context();
-    let response = app(ctx.clone(), server_config(DEFAULT_MAX_BODY_BYTES))
+    let response = app(ctx.clone(), server_config(DEFAULT_MAX_BODY_BYTES), 2)
         .expect("config")
         .oneshot(
             Request::builder()
@@ -217,7 +217,7 @@ fn server_config_serves_one_upload_within_the_request_deadline() {
 #[test]
 fn zero_body_limit_is_a_config_error() {
     assert_eq!(
-        app(context(), server_config(0)).err(),
+        app(context(), server_config(0), 2).err(),
         Some(ConfigError::Zero("max_body_bytes"))
     );
 }
@@ -228,7 +228,7 @@ async fn excessive_decoded_work_is_rejected_unsigned() {
     // Preserve format fields and replace the 36-bit sample count with its maximum.
     bytes[21] |= 0x0f;
     bytes[22..26].fill(0xff);
-    let response = app(context(), server_config(DEFAULT_MAX_BODY_BYTES))
+    let response = app(context(), server_config(DEFAULT_MAX_BODY_BYTES), 2)
         .expect("config")
         .oneshot(post(Body::from(bytes)))
         .await

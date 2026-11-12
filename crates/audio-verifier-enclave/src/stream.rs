@@ -2,9 +2,10 @@
 //!
 //! Nautilus's `/process_data` buffers the whole body before its handler runs, so this route,
 //! merged into the same `Router`, reads the body itself. Chunks go through a bounded channel to
-//! `measure_reader` on the blocking pool, so a request holds about the decoder's 1 MiB window
-//! and the channel's chunks, whatever the file's size. The route has its own concurrency permits
-//! and deadlines: Nautilus's apply only to its own routes.
+//! `measure_reader` on the blocking pool, so a request holds the decoder's window and the
+//! channel's chunks, whatever the file's size: about 1 MiB of the file for typical frames, and
+//! at most [`crate::MEASURE_JOB_BYTES`] in all. The route has its own concurrency permits and
+//! deadlines: Nautilus's apply only to its own routes.
 
 use std::{io, sync::Arc, time::Duration};
 
