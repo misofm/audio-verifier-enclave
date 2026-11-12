@@ -1,23 +1,32 @@
+mod stream;
+
 use std::time::Duration;
 
-use audio_verifier::{AudioPayload, measure};
+use audio_verifier::{AudioPayload, FileStats, measure};
 use axum::{Router, body::Bytes};
 use nautilus::{ConfigError, Intent, NautilusContext, NautilusError, ServerConfig, SignedResponse};
 use serde::{Deserialize, Serialize};
 
-/// Intent of the signed `IntentMessage<AudioPayload>`.
+pub use stream::{StreamConfig, measure_routes};
+
+/// Intent of the signed `IntentMessage<AudioPayload>`, verified on chain by
+/// `audio_verifier::verify_audio`.
 pub const AUDIO_INTENT: Intent = Intent(0);
 
-/// Default `/process_data` body limit.
+/// Intent of the signed `IntentMessage<MasterFilePayload>`, verified off chain. Intent 1 was the
+/// retired `AudioEncodingPayload` and is not reused.
+pub const MASTER_FILE_INTENT: Intent = Intent(2);
+
+/// Default limit on a file's size, for `/process_data` and `/v1/measure` alike.
 pub const DEFAULT_MAX_BODY_BYTES: usize = 256 * 1024 * 1024;
 
 /// Maximum decoded PCM work per request, including all channels (4 GiB).
 pub use audio_verifier::MAX_DECODED_BYTES;
 
-/// Deadline for one upload and measurement.
+/// Deadline for one `/process_data` upload and measurement.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// Deadline for the upload alone: 256 MiB needs about 3 MB/s, leaving at least 30 s to measure.
+/// Deadline for a `/process_data` upload alone: 256 MiB needs about 3 MB/s, leaving at least 30 s to measure.
 pub const BODY_READ_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// Open connections, matching the host bridge's 256. Idle ones cost little, because the single
@@ -30,6 +39,16 @@ pub const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Closes a connection that does no I/O for this long outside a handler.
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Concurrent `/v1/measure` jobs, besides the one `/process_data` upload; more get HTTP 429.
+/// Each holds about 1 MiB of the file and a decoder and hasher thread.
+pub const MEASURE_MAX_CONCURRENT: usize = 2;
+
+/// A `/v1/measure` body that delivers nothing for this long is abandoned.
+pub const MEASURE_CHUNK_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Deadline for one `/v1/measure` request, body and measurement: 256 MiB at 1 MB/s.
+pub const MEASURE_REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Environment variable that overrides the body limit.
 pub const MAX_BODY_BYTES_ENV: &str = "AUDIO_VERIFIER_MAX_BODY_BYTES";
@@ -61,7 +80,7 @@ impl From<&AudioPayload> for AudioJson {
     }
 }
 
-/// One signed payload in the `/process_data` response.
+/// One signed payload in a response.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignedJson<T> {
     /// Intent byte.
@@ -95,12 +114,81 @@ pub struct ProcessDataResponse {
     pub public_key: String,
 }
 
+/// BCS layout of the file binding signed under [`MASTER_FILE_INTENT`]: the audio facts, as
+/// signed under [`AUDIO_INTENT`], and the size and SHA-256 of the exact bytes measured.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MasterFilePayload {
+    /// The audio facts.
+    pub audio: AudioPayload,
+    /// Bytes of the file.
+    pub file_size: u64,
+    /// SHA-256 of the file's bytes.
+    pub file_sha256: Vec<u8>,
+}
+
+/// JSON view of a `MasterFilePayload`'s own fields; its `audio` is the response's `audio`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileJson {
+    /// Bytes of the file as a decimal string.
+    pub file_size: String,
+    /// SHA-256 of the file as hex.
+    pub file_sha256: String,
+}
+
+/// `/v1/measure` response body: the audio facts and the file binding, signed with one timestamp.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MeasureResponse {
+    /// The audio facts, for `verify_audio`.
+    pub audio: SignedJson<AudioJson>,
+    /// The file binding, for off-chain verifiers.
+    pub master_file: SignedJson<FileJson>,
+    /// Enclave Ed25519 public key as hex.
+    pub public_key: String,
+}
+
 /// Renders the signed audio facts as the `/process_data` response.
 pub fn response(ctx: &NautilusContext, audio: SignedResponse<AudioPayload>) -> ProcessDataResponse {
     ProcessDataResponse {
         audio: SignedJson::new(&audio, AudioJson::from(&audio.response.data)),
         public_key: ctx.public_key_hex(),
     }
+}
+
+/// Signing attempts for two messages that must carry the same timestamp. Nautilus stamps each
+/// message with its own clock read, and two signatures rarely straddle a millisecond.
+const SIGNING_ATTEMPTS: usize = 4;
+
+/// Signs the audio facts under [`AUDIO_INTENT`] and the file binding under
+/// [`MASTER_FILE_INTENT`], both with one timestamp.
+pub fn sign_measurement(
+    ctx: &NautilusContext,
+    audio: AudioPayload,
+    file: &FileStats,
+) -> Result<MeasureResponse, NautilusError> {
+    let binding = MasterFilePayload {
+        audio: audio.clone(),
+        file_size: file.len,
+        file_sha256: file.sha256.to_vec(),
+    };
+    for _ in 0..SIGNING_ATTEMPTS {
+        let audio = ctx.sign_intent(AUDIO_INTENT, audio.clone())?;
+        let binding = ctx.sign_intent(MASTER_FILE_INTENT, binding.clone())?;
+        if audio.response.timestamp_ms != binding.response.timestamp_ms {
+            continue;
+        }
+        let file = FileJson {
+            file_size: file.len.to_string(),
+            file_sha256: hex::encode(file.sha256),
+        };
+        return Ok(MeasureResponse {
+            audio: SignedJson::new(&audio, AudioJson::from(&audio.response.data)),
+            master_file: SignedJson::new(&binding, file),
+            public_key: ctx.public_key_hex(),
+        });
+    }
+    Err(NautilusError::Clock(
+        "the clock advanced during every signing attempt".into(),
+    ))
 }
 
 /// Measures `bytes` and signs the audio facts.
@@ -124,11 +212,25 @@ pub fn server_config(max_body_bytes: usize) -> ServerConfig {
     }
 }
 
-/// Builds the enclave router around an injected context.
+/// Limits of `/v1/measure` for files of up to `max_file_bytes`.
+pub fn stream_config(max_file_bytes: usize) -> StreamConfig {
+    StreamConfig {
+        max_file_bytes: max_file_bytes as u64,
+        max_concurrent: MEASURE_MAX_CONCURRENT,
+        chunk_timeout: MEASURE_CHUNK_TIMEOUT,
+        request_timeout: MEASURE_REQUEST_TIMEOUT,
+    }
+}
+
+/// Builds the enclave router around an injected context: Nautilus's `/health_check`,
+/// `/attestation` and buffered `/process_data`, and the streaming `/v1/measure`, whose file limit
+/// is `config.max_body_bytes`.
 pub fn app(ctx: NautilusContext, config: ServerConfig) -> Result<Router, ConfigError> {
-    nautilus::router(ctx, config, |bytes: Bytes, ctx: &NautilusContext| {
+    let measure = measure_routes(ctx.clone(), stream_config(config.max_body_bytes));
+    let router = nautilus::router(ctx, config, |bytes: Bytes, ctx: &NautilusContext| {
         process(&bytes, ctx)
-    })
+    })?;
+    Ok(router.merge(measure))
 }
 
 /// Resolves the body limit from `--max-body-bytes`, then the environment, then the default.
