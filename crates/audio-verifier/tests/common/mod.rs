@@ -387,14 +387,14 @@ pub fn utf8_number(number: u32) -> Vec<u8> {
 }
 
 #[derive(Default)]
-struct BitWriter {
+pub struct BitWriter {
     bytes: Vec<u8>,
     current: u64,
     filled: u32,
 }
 
 impl BitWriter {
-    fn write(&mut self, value: u64, bits: u32) {
+    pub fn write(&mut self, value: u64, bits: u32) {
         for shift in (0..bits).rev() {
             self.current = (self.current << 1) | ((value >> shift) & 1);
             self.filled += 1;
@@ -406,7 +406,17 @@ impl BitWriter {
         }
     }
 
-    fn finish(mut self) -> Vec<u8> {
+    /// Writes `count` zero bits, whole bytes at a time where it can.
+    pub fn zeros(&mut self, mut count: usize) {
+        while self.filled != 0 && count > 0 {
+            self.write(0, 1);
+            count -= 1;
+        }
+        self.bytes.resize(self.bytes.len() + count / 8, 0);
+        self.write(0, (count % 8) as u32);
+    }
+
+    pub fn finish(mut self) -> Vec<u8> {
         if self.filled > 0 {
             self.bytes.push((self.current << (8 - self.filled)) as u8);
         }
@@ -414,7 +424,7 @@ impl BitWriter {
     }
 }
 
-fn crc8(bytes: &[u8]) -> u8 {
+pub fn crc8(bytes: &[u8]) -> u8 {
     let mut crc = 0u8;
     for byte in bytes {
         crc ^= byte;
@@ -429,10 +439,10 @@ fn crc8(bytes: &[u8]) -> u8 {
     crc
 }
 
-fn crc16(bytes: &[u8]) -> u16 {
-    let mut crc = 0u16;
-    for byte in bytes {
-        crc ^= u16::from(*byte) << 8;
+pub fn crc16(bytes: &[u8]) -> u16 {
+    let mut table = [0u16; 256];
+    for (byte, entry) in table.iter_mut().enumerate() {
+        let mut crc = (byte as u16) << 8;
         for _ in 0..8 {
             crc = if crc & 0x8000 != 0 {
                 (crc << 1) ^ 0x8005
@@ -440,6 +450,9 @@ fn crc16(bytes: &[u8]) -> u16 {
                 crc << 1
             };
         }
+        *entry = crc;
     }
-    crc
+    bytes.iter().fold(0u16, |crc, &byte| {
+        (crc << 8) ^ table[usize::from((crc >> 8) as u8 ^ byte)]
+    })
 }

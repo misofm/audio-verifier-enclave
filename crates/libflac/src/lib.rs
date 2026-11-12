@@ -3,12 +3,18 @@
 //!
 //! [`decode`] runs libFLAC over an in-memory stream and hands each decoded frame,
 //! with its exact byte range, to a [`Handler`]. [`decode_reader`] does the same
-//! over any [`Read`], front to back, holding only a bounded window of the input:
-//! from the end of the last complete frame to libFLAC's read position, dropped
-//! once 1 MiB of finished frames has accumulated. Unlike libFLAC's default
-//! behaviour, decoding is strict: the first error libFLAC reports ends it, so
-//! libFLAC never resynchronises, skips bytes or fills missing frames with silence
-//! on the handler's behalf.
+//! over any [`Read`], front to back, holding only a window of the input: from the
+//! end of the last complete frame to libFLAC's read position, dropped once 1 MiB of
+//! finished frames has accumulated. Unlike libFLAC's default behaviour, decoding is
+//! strict: the first error libFLAC reports ends it, so libFLAC never resynchronises,
+//! skips bytes or fills missing frames with silence on the handler's behalf.
+//!
+//! Both functions give libFLAC the same reads, every one filled unless the stream
+//! ends, so their verdicts never depend on how a reader splits its input: libFLAC's
+//! own checks differ with its read boundaries. Both refuse a frame over
+//! [`MAX_FRAME_BYTES`], the most STREAMINFO can declare, and stop reading once more
+//! than [`MAX_PENDING_BYTES`] lie past the last complete frame, so the window holds
+//! at most that and 1 MiB of finished frames, about 17 MiB.
 
 mod ffi;
 
@@ -141,9 +147,17 @@ pub enum Error<E> {
     /// libFLAC stopped in a state other than end of stream.
     #[error("libFLAC decoder stopped in state {}", state_name(*.0))]
     State(c_int),
-    /// The reader of [`decode_reader`] failed.
+    /// The reader of [`decode_reader`] failed or panicked.
     #[error("reading the input failed: {0}")]
     Read(io::Error),
+    /// A frame is, or runs, over [`MAX_FRAME_BYTES`].
+    #[error("frame {frame} at byte {offset} is over {MAX_FRAME_BYTES} bytes")]
+    FrameTooLarge {
+        /// Index of the frame.
+        frame: u64,
+        /// Byte offset of the frame.
+        offset: u64,
+    },
 }
 
 /// How a successful [`decode`] ended.
@@ -177,6 +191,21 @@ pub struct ReaderStats {
 /// Bytes of finished frames kept before they are dropped in one move.
 const RELEASE_THRESHOLD: usize = 1 << 20;
 
+/// Largest frame decoded, from the start of its header through its CRC-16: STREAMINFO's 24-bit
+/// `max_frame_size` cannot declare more.
+pub const MAX_FRAME_BYTES: u64 = (1 << 24) - 1;
+
+/// Most input read past the end of the last complete frame, or from the start of the stream
+/// before the first: the largest frame, and 128 KiB for metadata (at most 42 bytes and 64 KiB
+/// for `audio-verifier`) and libFLAC's 8 KiB of read-ahead. A read beyond it ends decoding with
+/// [`Error::FrameTooLarge`].
+pub const MAX_PENDING_BYTES: u64 = MAX_FRAME_BYTES + (128 << 10);
+
+/// Room [`decode_reader`] reserves for its window at the start, so that it never reallocates,
+/// and copies, the window: the pending input, one more read and the finished frames not yet
+/// dropped. Only the pages it fills take memory.
+const WINDOW_CAPACITY: usize = MAX_PENDING_BYTES as usize + (64 << 10) + RELEASE_THRESHOLD;
+
 /// Decodes the stream `reader` gives, front to back, as [`decode`] does, holding only the
 /// input from the end of the last complete frame to libFLAC's read position.
 pub fn decode_reader<R: Read, H: Handler>(
@@ -185,9 +214,10 @@ pub fn decode_reader<R: Read, H: Handler>(
 ) -> Result<(Summary, ReaderStats), Error<H::Error>> {
     let window = Window {
         reader,
-        held: Vec::new(),
+        held: Vec::with_capacity(WINDOW_CAPACITY),
         base: 0,
         peak: 0,
+        error: None,
     };
     run(window, handler).map(|(summary, window)| {
         (
@@ -246,17 +276,29 @@ struct Window<R> {
     /// Stream offset of `held[0]`.
     base: u64,
     peak: usize,
+    /// A reader error that followed a partial fill, returned by the next read.
+    error: Option<io::Error>,
 }
 
 impl<R: Read> Input for Window<R> {
+    /// Fills `buffer` unless the stream ends, as `Slice` does, whatever reads the reader gives.
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        let count = loop {
-            match self.reader.read(buffer) {
-                Ok(count) => break count,
+        if let Some(error) = self.error.take() {
+            return Err(error);
+        }
+        let mut count = 0;
+        while count < buffer.len() {
+            match self.reader.read(&mut buffer[count..]) {
+                Ok(0) => break,
+                Ok(read) => count += read,
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(error) => return Err(error),
+                Err(error) if count == 0 => return Err(error),
+                Err(error) => {
+                    self.error = Some(error);
+                    break;
+                }
             }
-        };
+        }
         self.held.extend_from_slice(&buffer[..count]);
         self.peak = self.peak.max(self.held.len());
         Ok(count)
@@ -453,16 +495,37 @@ unsafe extern "C" fn read<I: Input, H: Handler>(
     }
     // SAFETY: libFLAC passes a valid in/out byte count.
     let capacity = unsafe { *bytes };
-    // SAFETY: `buffer` has room for `capacity` bytes for the callback's duration
-    // and overlaps nothing the input holds.
-    let buffer = unsafe { slice::from_raw_parts_mut(buffer, capacity) };
-    let count = match session.input.borrow_mut().read(buffer) {
-        Ok(count) => count,
-        Err(error) => {
+    // SAFETY: `buffer` has room for `capacity` bytes for the callback's duration and overlaps
+    // nothing the input holds. libFLAC's buffer starts uninitialized, and a `Read` may not be
+    // given uninitialized memory, so it is zeroed first.
+    let buffer = unsafe {
+        ptr::write_bytes(buffer, 0, capacity);
+        slice::from_raw_parts_mut(buffer, capacity)
+    };
+    // A panic must not unwind into libFLAC; the input is not used again after one.
+    let read = panic::catch_unwind(AssertUnwindSafe(|| {
+        let mut input = session.input.borrow_mut();
+        input.read(buffer).map(|count| (count, input.position()))
+    }));
+    let (count, position) = match read {
+        Ok(Ok(read)) => read,
+        Ok(Err(error)) => {
             session.fail(Error::Read(error));
             return ffi::READ_STATUS_ABORT;
         }
+        Err(_) => {
+            session.fail(Error::Read(io::Error::other("the reader panicked")));
+            return ffi::READ_STATUS_ABORT;
+        }
     };
+    let start = session.end.get();
+    if position.saturating_sub(start) > MAX_PENDING_BYTES {
+        session.fail(Error::FrameTooLarge {
+            frame: session.frames.get(),
+            offset: start,
+        });
+        return ffi::READ_STATUS_ABORT;
+    }
     // SAFETY: libFLAC passes a valid in/out byte count.
     unsafe { *bytes = count };
     if count == 0 {
@@ -532,6 +595,13 @@ unsafe extern "C" fn write<I: Input, H: Handler>(
         return ffi::WRITE_STATUS_ABORT;
     };
     let start = session.end.get();
+    if end.saturating_sub(start) > MAX_FRAME_BYTES {
+        session.fail(Error::FrameTooLarge {
+            frame: session.frames.get(),
+            offset: start,
+        });
+        return ffi::WRITE_STATUS_ABORT;
+    }
     let input = session.input.borrow();
     let Some(bytes) = input.bytes(start, end) else {
         drop(input);
@@ -599,5 +669,87 @@ fn state_name(state: c_int) -> &'static str {
         9 => "UNINITIALIZED",
         10 => "END_OF_LINK",
         _ => "unknown",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Gives `chunk` bytes per call, interrupted every other call, then `error` at `fail_at`.
+    struct Trickle {
+        bytes: Vec<u8>,
+        at: usize,
+        chunk: usize,
+        interrupt: bool,
+        fail_at: Option<usize>,
+    }
+
+    impl Read for Trickle {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            self.interrupt = !self.interrupt;
+            if self.interrupt {
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            if self.fail_at.is_some_and(|at| self.at >= at) {
+                return Err(io::Error::other("connection reset"));
+            }
+            let end = self.fail_at.unwrap_or(self.bytes.len());
+            let count = buffer.len().min(self.chunk).min(end - self.at);
+            buffer[..count].copy_from_slice(&self.bytes[self.at..self.at + count]);
+            self.at += count;
+            Ok(count)
+        }
+    }
+
+    fn window(chunk: usize, fail_at: Option<usize>) -> Window<Trickle> {
+        Window {
+            reader: Trickle {
+                bytes: (0..20_000).map(|i| i as u8).collect(),
+                at: 0,
+                chunk,
+                interrupt: false,
+                fail_at,
+            },
+            held: Vec::new(),
+            base: 0,
+            peak: 0,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn window_reads_fill_the_buffer_as_slice_reads_do() {
+        let bytes: Vec<u8> = (0..20_000).map(|i| i as u8).collect();
+        let mut slice = Slice {
+            input: &bytes,
+            read: 0,
+        };
+        for chunk in [1, 7, 4096, usize::MAX] {
+            let mut window = window(chunk, None);
+            let mut slice_counts = Vec::new();
+            let mut window_counts = Vec::new();
+            slice.read = 0;
+            for size in [8192, 100, 8192, 8192, 8192] {
+                let mut expected = vec![0; size];
+                let mut buffer = vec![0; size];
+                slice_counts.push(slice.read(&mut expected).expect("slice"));
+                window_counts.push(window.read(&mut buffer).expect("window"));
+                assert_eq!(buffer, expected, "chunk {chunk}");
+            }
+            assert_eq!(window_counts, slice_counts, "chunk {chunk}");
+            assert_eq!(window_counts, [8192, 100, 8192, 3516, 0]);
+            assert_eq!(window.held, bytes);
+        }
+    }
+
+    #[test]
+    fn window_returns_a_reader_error_after_the_bytes_before_it() {
+        let mut window = window(1000, Some(5000));
+        let mut buffer = vec![0; 8192];
+        assert_eq!(window.read(&mut buffer).expect("partial fill"), 5000);
+        let error = window.read(&mut buffer).expect_err("then the error");
+        assert_eq!(error.to_string(), "connection reset");
+        assert_eq!(window.position(), 5000);
     }
 }

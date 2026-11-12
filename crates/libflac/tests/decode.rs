@@ -233,3 +233,46 @@ fn reader_error_ends_decoding() {
     );
     assert!(!record.frames.is_empty());
 }
+
+#[test]
+fn reader_panic_is_a_read_error() {
+    struct Panicking<'a>(Chunked<'a>);
+
+    impl Read for Panicking<'_> {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            if self.0.at >= self.0.bytes.len() / 2 {
+                panic!("reader panic");
+            }
+            self.0.read(buffer)
+        }
+    }
+
+    let reader = Panicking(Chunked::new(FIXTURE, 4096));
+    let mut record = Record::default();
+    let error = decode_reader(reader, &mut record).expect_err("panic");
+    assert!(
+        matches!(&error, Error::Read(error) if error.to_string() == "the reader panicked"),
+        "{error:?}"
+    );
+    assert!(!record.frames.is_empty());
+}
+
+#[test]
+fn reader_is_given_zeroed_buffers() {
+    /// Fails if the buffer it is handed holds anything but zeros.
+    struct Inspecting<'a>(Chunked<'a>);
+
+    impl Read for Inspecting<'_> {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            if buffer.iter().any(|&byte| byte != 0) {
+                return Err(io::Error::other("the buffer was not zeroed"));
+            }
+            self.0.read(buffer)
+        }
+    }
+
+    for chunk in [1, 4096, usize::MAX] {
+        let reader = Inspecting(Chunked::new(FIXTURE, chunk));
+        decode_reader(reader, &mut Record::default()).expect("zeroed buffers");
+    }
+}
