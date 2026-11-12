@@ -1,7 +1,6 @@
-//! Differential fuzz: every mutated file must get the same result, error included, from
-//! `measure` (buffered) and from `measure_reader` (streamed, in several chunkings), and on
-//! success the streamed stats must cover exactly the file. The seed is fixed; set
-//! `FUZZ_ITERATIONS` to run more mutations per base than the default.
+//! Differential fuzz: every mutated file must get the same result, error included, read whole
+//! and read in several chunkings, and on success the stats must cover exactly the file. The
+//! seed is fixed; set `FUZZ_ITERATIONS` to run more mutations per base than the default.
 
 mod common;
 
@@ -57,9 +56,8 @@ impl Read for Jittered<'_> {
 }
 
 fn check(bytes: &[u8], seed: u64) -> Result<AudioPayload, Error> {
-    let buffered = measure(bytes);
+    let whole = measure(bytes);
     let mut readers: Vec<(String, Box<dyn Read + '_>)> = vec![
-        ("whole".into(), Box::new(bytes)),
         (
             "jitter-9000".into(),
             Box::new(Jittered {
@@ -84,19 +82,14 @@ fn check(bytes: &[u8], seed: u64) -> Result<AudioPayload, Error> {
         readers.push((format!("split-{split}"), Box::new(head.chain(tail))));
     }
     for (name, reader) in readers {
-        let streamed = measure_reader(reader).map(|(audio, stats)| {
+        let chunked = measure_reader(reader).map(|(audio, stats)| {
             assert_eq!(stats.len, bytes.len() as u64, "{name}, seed {seed}");
             assert_eq!(stats.sha256, <[u8; 32]>::from(Sha256::digest(bytes)));
             audio
         });
-        assert_eq!(
-            streamed,
-            buffered,
-            "{name}, seed {seed}, {} bytes",
-            bytes.len()
-        );
+        assert_eq!(chunked, whole, "{name}, seed {seed}, {} bytes", bytes.len());
     }
-    buffered
+    whole
 }
 
 fn metadata_block(rng: &mut Rng) -> Vec<u8> {
@@ -190,7 +183,7 @@ fn mutate(base: &[u8], rng: &mut Rng) -> Vec<u8> {
 }
 
 #[test]
-fn buffered_and_streamed_agree_on_mutated_files() {
+fn whole_and_chunked_reads_agree_on_mutated_files() {
     let iterations = std::env::var("FUZZ_ITERATIONS")
         .ok()
         .and_then(|value| value.parse().ok())

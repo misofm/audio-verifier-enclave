@@ -1,6 +1,6 @@
 //! Frames over `libflac::MAX_FRAME_BYTES` (2^24 - 1, the most STREAMINFO can declare) are
-//! refused on both paths with the same error, and a frame that never ends stops the streamed
-//! decoder after `MAX_PENDING_BYTES`, instead of holding the whole file.
+//! refused however they are read, and a frame that never ends stops the decoder after
+//! `MAX_PENDING_BYTES`, instead of holding the whole file.
 
 mod common;
 
@@ -122,38 +122,34 @@ impl Read for Unterminated {
 #[test]
 fn frame_of_the_largest_declarable_size_is_measured() {
     let bytes = big_frame_file(MAX_FRAME_BYTES as usize);
-    let audio = measure(&bytes).expect("buffered");
+    let audio = measure(&bytes).expect("whole");
     assert_eq!(audio.samples_per_channel, 16);
-    for chunk in [4093, 1 << 20, usize::MAX] {
+    for chunk in [4093, 1 << 20] {
         let reader = Chunked {
             bytes: &bytes,
             at: 0,
             chunk,
         };
-        let (streamed, stats) = measure_reader(reader).expect("streamed");
-        assert_eq!(streamed, audio, "chunks of {chunk}");
+        let (chunked, stats) = measure_reader(reader).expect("chunked");
+        assert_eq!(chunked, audio, "chunks of {chunk}");
         assert_eq!(stats.len, bytes.len() as u64);
         assert!(stats.peak_held as u64 <= MAX_PENDING_BYTES, "{stats:?}");
     }
 }
 
 #[test]
-fn frame_over_the_largest_declarable_size_is_rejected_on_both_paths() {
+fn frame_over_the_largest_declarable_size_is_rejected() {
     let bytes = big_frame_file(MAX_FRAME_BYTES as usize + 1);
-    let buffered = measure(&bytes);
-    assert_eq!(
-        buffered,
-        Err(Error::Decode(LIMIT_MESSAGE.into())),
-        "{buffered:?}"
-    );
-    for chunk in [4093, 1 << 20, usize::MAX] {
+    let whole = measure(&bytes);
+    assert_eq!(whole, Err(Error::Decode(LIMIT_MESSAGE.into())), "{whole:?}");
+    for chunk in [4093, 1 << 20] {
         let reader = Chunked {
             bytes: &bytes,
             at: 0,
             chunk,
         };
-        let streamed = measure_reader(reader).map(|(audio, _)| audio);
-        assert_eq!(streamed, buffered, "chunks of {chunk}");
+        let chunked = measure_reader(reader).map(|(audio, _)| audio);
+        assert_eq!(chunked, whole, "chunks of {chunk}");
     }
 }
 
@@ -174,7 +170,7 @@ fn unterminated_frame_stops_the_reader_after_the_limit() {
         reader.sent
     );
 
-    // The buffered path refuses the same file at the same place.
+    // The same file, read whole, is refused at the same place.
     let mut bytes = unterminated_head();
     bytes.resize(bytes.len() + (20 << 20), 0);
     assert_eq!(measure(&bytes), streamed);

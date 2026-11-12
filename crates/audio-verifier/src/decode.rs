@@ -2,7 +2,7 @@ use std::io::Read;
 use std::sync::mpsc;
 use std::{panic, thread};
 
-use libflac::{Frame, Handler, ReaderStats};
+use libflac::{Frame, Handler};
 use md5::{Digest as _, Md5};
 
 use crate::frame_header::{self, FrameHeader};
@@ -10,36 +10,12 @@ use crate::{Error, StreamInfo};
 
 const PIPELINE_DEPTH: usize = 4;
 
-pub(crate) fn verify_and_digest(bytes: &[u8], info: &StreamInfo) -> Result<[u8; 32], Error> {
-    verify(info, |checker| {
-        libflac::decode(bytes, checker).map(|summary| (summary, bytes.len() as u64))
-    })
-}
-
-/// As [`verify_and_digest`], over a stream read front to back in a bounded window.
-pub(crate) fn verify_and_digest_reader<R: Read>(
-    reader: R,
+/// Decodes the stream, checks every frame against `info`, and returns the BLAKE3 digest of its
+/// PCM with how the decode ended.
+pub(crate) fn verify_and_digest(
+    input: impl Read,
     info: &StreamInfo,
-) -> Result<([u8; 32], ReaderStats), Error> {
-    let mut stats = None;
-    let digest = verify(info, |checker| {
-        libflac::decode_reader(reader, checker).map(|(summary, read)| {
-            stats = Some(read);
-            (summary, read.len)
-        })
-    })?;
-    Ok((
-        digest,
-        stats.expect("a successful decode reports its reads"),
-    ))
-}
-
-type Decoded = Result<(libflac::Summary, u64), libflac::Error<Error>>;
-
-fn verify(
-    info: &StreamInfo,
-    decode: impl FnOnce(&mut Canonical<'_>) -> Decoded,
-) -> Result<[u8; 32], Error> {
+) -> Result<([u8; 32], libflac::Summary), Error> {
     let (full, filled) = mpsc::sync_channel::<Vec<u8>>(PIPELINE_DEPTH);
     let (empty, recycled) = mpsc::sync_channel::<Vec<u8>>(PIPELINE_DEPTH);
     for _ in 0..PIPELINE_DEPTH {
@@ -61,8 +37,8 @@ fn verify(
             (md5, *blake3.finalize().as_bytes())
         });
         let mut checker = Canonical::new(info, &full, &recycled);
-        let checked = match decode(&mut checker) {
-            Ok((summary, len)) => checker.finish(len, summary),
+        let checked = match libflac::decode(input, &mut checker) {
+            Ok(summary) => checker.finish(&summary).map(|samples| (samples, summary)),
             Err(libflac::Error::Handler(error)) => Err(error),
             Err(libflac::Error::Read(error)) => Err(Error::Read(error.to_string())),
             // libFLAC reports a gap only after reading the next frame in full,
@@ -84,7 +60,7 @@ fn verify(
         (checked, digests)
     });
 
-    let samples = checked?;
+    let (samples, summary) = checked?;
     if samples != info.total_samples {
         return Err(Error::SampleCount {
             expected: info.total_samples,
@@ -98,7 +74,7 @@ fn verify(
         });
     }
 
-    Ok(pcm_digest)
+    Ok((pcm_digest, summary))
 }
 
 /// Checks every frame against STREAMINFO and sends its packed PCM to the hasher.
@@ -244,11 +220,11 @@ impl<'a> Canonical<'a> {
     }
 
     /// The end-of-stream checks. Returns the decoded samples per channel.
-    fn finish(&self, len: u64, summary: libflac::Summary) -> Result<u64, Error> {
-        if summary.end != len {
+    fn finish(&self, summary: &libflac::Summary) -> Result<u64, Error> {
+        if summary.end != summary.len {
             return Err(Error::Decode(format!(
                 "{} bytes after the last complete frame at byte {}",
-                len - summary.end,
+                summary.len - summary.end,
                 summary.end
             )));
         }

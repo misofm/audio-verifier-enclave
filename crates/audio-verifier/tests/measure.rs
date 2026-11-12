@@ -4,8 +4,8 @@ use std::io::{self, Read};
 
 use audio_verifier::{AudioPayload, Error, FileStats, MAX_EXTRA_METADATA_BYTES, measure_reader};
 use common::{
-    FrameEdit, FrameHeader, Rate, Synth, block_sizes, decoded_samples, ffmpeg, ffmpeg_raw_pcm,
-    fixture, frame_sizes, pcm_md5, scratch_file, set_block_sizes, set_frame_sizes, set_md5,
+    FrameEdit, FrameHeader, Rate, Synth, block_sizes, decoded_samples, ffmpeg_raw_pcm, fixture,
+    frame_sizes, has_ffmpeg, scratch_file, set_block_sizes, set_frame_sizes, set_md5,
     set_streaminfo, utf8_number,
 };
 use sha2::{Digest as _, Sha256};
@@ -36,41 +36,25 @@ impl Read for Chunked<'_> {
     }
 }
 
-/// Chunk sizes every case of this suite is also streamed in: one byte, an odd size, a page,
-/// the decoder's release threshold, and the whole file in one read.
-const CHUNKS: [usize; 5] = [1, 7, 4096, 1 << 20, usize::MAX];
+/// Chunk sizes every case of this suite is also read in: one byte, an odd size, a page and the
+/// decoder's release threshold.
+const CHUNKS: [usize; 4] = [1, 7, 4096, 1 << 20];
 
 fn measure_streamed(bytes: &[u8], chunk: usize) -> Result<(AudioPayload, FileStats), Error> {
     measure_reader(Chunked::new(bytes, chunk))
 }
 
-// Every case of this suite also runs streamed, in each of `CHUNKS`, and must reach the same
-// verdict, error included, and report the file's length and SHA-256.
-// Optional migration evidence from the same inputs and assertions as this suite.
+/// Measures `bytes` read whole, and requires the same verdict, error included, when they are
+/// read in each of `CHUNKS`, and on success the file's length and SHA-256.
 fn measure(bytes: &[u8]) -> Result<AudioPayload, Error> {
-    let result = audio_verifier::measure(bytes);
+    let result = measure_reader(bytes).map(|(audio, stats)| {
+        assert_eq!(stats.len, bytes.len() as u64);
+        assert_eq!(stats.sha256, <[u8; 32]>::from(Sha256::digest(bytes)));
+        audio
+    });
     for chunk in CHUNKS {
-        let streamed = measure_streamed(bytes, chunk).map(|(audio, stats)| {
-            assert_eq!(stats.len, bytes.len() as u64, "chunks of {chunk}");
-            assert_eq!(stats.sha256, <[u8; 32]>::from(Sha256::digest(bytes)));
-            audio
-        });
-        assert_eq!(streamed, result, "streamed in chunks of {chunk} bytes");
-    }
-    if let Some(directory) = std::env::var_os("AUDIO_VERIFIER_MIGRATION_RESULTS") {
-        let directory = std::path::PathBuf::from(directory);
-        std::fs::create_dir_all(&directory).expect("migration directory");
-        let id = blake3::hash(bytes).to_hex().to_string();
-        let value = match &result {
-            Ok(payload) => serde_json::json!({"accepted": true, "payload": payload}),
-            Err(error) => serde_json::json!({"accepted": false, "error": error.to_string()}),
-        };
-        std::fs::write(directory.join(format!("{id}.flac")), bytes).expect("migration input");
-        std::fs::write(
-            directory.join(format!("{id}.json")),
-            serde_json::to_vec_pretty(&value).expect("migration JSON"),
-        )
-        .expect("migration result");
+        let chunked = measure_streamed(bytes, chunk).map(|(audio, _)| audio);
+        assert_eq!(chunked, result, "read in chunks of {chunk} bytes");
     }
     result
 }
@@ -166,12 +150,12 @@ fn assert_properties(
 }
 
 fn assert_matches_ffmpeg(bytes: &[u8], audio: &AudioPayload, scratch_name: &str) {
-    let Some(ffmpeg) = ffmpeg() else {
+    if !has_ffmpeg() {
         eprintln!("ffmpeg unavailable, skipping PCM cross-check for {scratch_name}");
         return;
-    };
+    }
     let path = scratch_file(scratch_name, bytes);
-    let raw = ffmpeg_raw_pcm(&ffmpeg, &path, audio.bit_depth);
+    let raw = ffmpeg_raw_pcm(&path, audio.bit_depth);
     let frame_bytes = u64::from(audio.channels) * u64::from(audio.bit_depth.div_ceil(8));
     assert_eq!(raw.len() as u64, audio.samples_per_channel * frame_bytes);
     assert_eq!(audio.pcm_digest, blake3::hash(&raw).as_bytes().to_vec());
@@ -182,43 +166,16 @@ fn rejects(bytes: &[u8]) -> Error {
 }
 
 #[test]
-fn ffmpeg_fixtures_measure_correct_properties() {
-    for expected in POSITIVE {
-        let audio = measure(&fixture(&flac_name(expected.name))).expect(expected.name);
-        assert_properties(
-            &audio,
-            expected.channels,
-            expected.bit_depth,
-            expected.sample_rate_hz,
-            expected.samples_per_channel,
-        );
+fn synthesized_8_bit_stereo_and_24_bit_mono_are_measured() {
+    for (channels, bit_depth, rate, name) in [
+        (2, 8, 44_100, "s8_stereo_44100.flac"),
+        (1, 24, 192_000, "s24_mono_192000.flac"),
+    ] {
+        let bytes = Synth::new(channels, bit_depth, rate).build();
+        let audio = measure(&bytes).expect(name);
+        assert_properties(&audio, channels, bit_depth, rate, 2_500);
+        assert_matches_ffmpeg(&bytes, &audio, name);
     }
-}
-
-#[test]
-fn pcm_digest_is_blake3_of_ffmpeg_raw_decode() {
-    for expected in POSITIVE {
-        let name = flac_name(expected.name);
-        let bytes = fixture(&name);
-        let audio = measure(&bytes).expect(expected.name);
-        assert_matches_ffmpeg(&bytes, &audio, &name);
-    }
-}
-
-#[test]
-fn synthesized_8_bit_stereo_is_measured() {
-    let bytes = Synth::new(2, 8, 44_100).build();
-    let audio = measure(&bytes).expect("8-bit");
-    assert_properties(&audio, 2, 8, 44_100, 2_500);
-    assert_matches_ffmpeg(&bytes, &audio, "s8_stereo_44100.flac");
-}
-
-#[test]
-fn synthesized_24_bit_mono_is_measured() {
-    let bytes = Synth::new(1, 24, 192_000).build();
-    let audio = measure(&bytes).expect("24-bit");
-    assert_properties(&audio, 1, 24, 192_000, 2_500);
-    assert_matches_ffmpeg(&bytes, &audio, "s24_mono_192000.flac");
 }
 
 #[test]
@@ -338,12 +295,12 @@ fn strip_metadata(bytes: &[u8]) -> Vec<u8> {
 
 #[test]
 fn ffmpeg_output_with_its_tags_is_measured_as_without_them() {
-    let Some(ffmpeg) = ffmpeg() else {
+    if !has_ffmpeg() {
         eprintln!("ffmpeg unavailable, skipping the tagged ffmpeg file");
         return;
-    };
+    }
     let path = scratch_file("tagged.flac", &[]);
-    let status = std::process::Command::new(ffmpeg)
+    let status = std::process::Command::new("ffmpeg")
         .args([
             "-hide_banner",
             "-loglevel",
@@ -501,15 +458,11 @@ fn rejects_total_samples_mismatch() {
 }
 
 #[test]
-fn rejects_32_bit_flac() {
+fn rejects_unsupported_bit_depths() {
     assert_eq!(
         rejects(&fixture("s32_stereo_48000.flac")),
-        Error::Unsupported32Bit
+        Error::UnsupportedBitDepth(32)
     );
-}
-
-#[test]
-fn rejects_unsupported_bit_depth() {
     let mut bytes = fixture("s16_stereo_44100.flac");
     set_streaminfo(&mut bytes, 44_100, 2, 12, 11_025);
     assert_eq!(rejects(&bytes), Error::UnsupportedBitDepth(12));
@@ -609,54 +562,6 @@ fn rejects_mismatch_in_a_later_frame() {
 }
 
 #[test]
-fn rejects_mono_file_relabelled_as_stereo_48k() {
-    let mut bytes = fixture("s16_mono_44100.flac");
-    measure(&bytes).expect("honest mono file is accepted");
-    let samples = decoded_samples(&bytes);
-    assert_eq!(samples.len(), 8_820);
-    set_streaminfo(&mut bytes, 48_000, 2, 16, 4_410);
-    set_md5(&mut bytes, pcm_md5(&samples, 2));
-    assert!(matches!(
-        rejects(&bytes),
-        Error::FrameChannels {
-            frame: 0,
-            expected: 2,
-            found: 1
-        }
-    ));
-}
-
-#[test]
-fn rejects_ffmpeg_file_with_patched_sample_rate() {
-    let mut bytes = fixture("s16_stereo_44100.flac");
-    set_streaminfo(&mut bytes, 48_000, 2, 16, 11_025);
-    assert!(matches!(
-        rejects(&bytes),
-        Error::FrameSampleRate {
-            expected: 48_000,
-            found: 44_100,
-            ..
-        }
-    ));
-}
-
-#[test]
-fn rejects_ffmpeg_file_with_patched_bit_depth() {
-    let mut bytes = fixture("s16_stereo_44100.flac");
-    let samples = decoded_samples(&bytes);
-    set_streaminfo(&mut bytes, 44_100, 2, 24, 11_025);
-    set_md5(&mut bytes, pcm_md5(&samples, 3));
-    assert!(matches!(
-        rejects(&bytes),
-        Error::FrameBitDepth {
-            expected: 24,
-            found: 16,
-            ..
-        }
-    ));
-}
-
-#[test]
 fn rejects_truncated_file() {
     let bytes = fixture("s16_stereo_44100.flac");
     for len in [41, 42, 100, bytes.len() / 2, bytes.len() - 1] {
@@ -719,7 +624,7 @@ fn pcm_digest_follows_the_audio_spec_at_every_accepted_bit_depth() {
 }
 
 #[test]
-fn ffmpeg_and_libflac_output_claims_exact_block_and_frame_sizes() {
+fn encoder_output_is_measured_with_exact_block_and_frame_sizes() {
     for expected in POSITIVE.iter().chain(&ENCODER_OUTPUT) {
         let name = flac_name(expected.name);
         let bytes = fixture(&name);

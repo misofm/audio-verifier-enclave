@@ -15,7 +15,7 @@ const MIN_BLOCK_SIZE_FLOOR: u16 = 16;
 
 /// STREAMINFO fields of a FLAC file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct StreamInfo {
+pub(crate) struct StreamInfo {
     /// Smallest block size in samples, excluding the last block.
     pub min_block_size: u16,
     /// Largest block size in samples.
@@ -72,15 +72,12 @@ impl StreamInfo {
     }
 
     /// Applies the attestation rules and the decoded-PCM limit, which STREAMINFO alone decides.
-    pub fn validate(&self) -> Result<(), Error> {
+    pub(crate) fn validate(&self) -> Result<(), Error> {
         if self.md5 == [0; 16] {
             return Err(Error::ZeroMd5);
         }
         if self.total_samples == 0 {
             return Err(Error::ZeroTotalSamples);
-        }
-        if self.bit_depth == 32 {
-            return Err(Error::Unsupported32Bit);
         }
         if !SUPPORTED_BIT_DEPTHS.contains(&self.bit_depth) {
             return Err(Error::UnsupportedBitDepth(self.bit_depth));
@@ -105,7 +102,7 @@ impl StreamInfo {
     }
 
     /// Bytes per sample in the digested PCM stream, `ceil(bit_depth / 8)`.
-    pub fn bytes_per_sample(&self) -> usize {
+    pub(crate) fn bytes_per_sample(&self) -> usize {
         usize::from(self.bit_depth.div_ceil(8))
     }
 }

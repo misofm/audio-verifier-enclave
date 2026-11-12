@@ -1,7 +1,7 @@
 use std::io::{self, Read};
 use std::panic;
 
-use libflac::{Error, ErrorStatus, Frame, Handler, StreamInfo, decode, decode_reader};
+use libflac::{Error, ErrorStatus, Frame, Handler, StreamInfo, decode};
 
 const FIXTURE: &[u8] =
     include_bytes!("../../audio-verifier/tests/fixtures/libflac_s16_stereo_44100.flac");
@@ -53,8 +53,8 @@ fn frames_tile_the_input_after_streaminfo() {
     let summary = decode(FIXTURE, &mut record).expect("decode");
     let info = record.info.expect("STREAMINFO");
     assert_eq!((info.channels, info.bits_per_sample), (2, 16));
-    assert_eq!(summary.frames, record.frames.len() as u64);
     assert_eq!(summary.end, FIXTURE.len() as u64);
+    assert_eq!(summary.len, FIXTURE.len() as u64);
 
     let mut offset = 42;
     for (index, (frame, start, len, _)) in record.frames.iter().enumerate() {
@@ -119,7 +119,7 @@ fn corrupt_frame_is_a_stream_error() {
     let middle = bytes.len() / 2;
     bytes[middle] ^= 0x01;
     let mut record = Record::default();
-    let error = decode(&bytes, &mut record).expect_err("corrupt frame");
+    let error = decode(&bytes[..], &mut record).expect_err("corrupt frame");
     assert!(
         matches!(
             error,
@@ -139,7 +139,7 @@ fn trailing_garbage_is_lost_sync() {
     let mut bytes = FIXTURE.to_vec();
     bytes.extend_from_slice(b"TAG trailing bytes");
     let mut record = Record::default();
-    let error = decode(&bytes, &mut record).expect_err("trailing bytes");
+    let error = decode(&bytes[..], &mut record).expect_err("trailing bytes");
     assert!(
         matches!(
             error,
@@ -154,7 +154,7 @@ fn trailing_garbage_is_lost_sync() {
 
 #[test]
 fn input_without_streaminfo_is_rejected() {
-    let error = decode(b"not flac at all", &mut Record::default()).expect_err("not FLAC");
+    let error = decode(&b"not flac at all"[..], &mut Record::default()).expect_err("not FLAC");
     assert!(!matches!(error, Error::Handler(_)), "{error:?}");
 }
 
@@ -191,33 +191,30 @@ impl Read for Chunked<'_> {
 }
 
 #[test]
-fn reader_decodes_the_same_frames_as_the_slice() {
+fn chunked_reads_decode_the_same_frames() {
     let mut whole = Record::default();
     let summary = decode(FIXTURE, &mut whole).expect("decode");
-    for chunk in [1, 7, 4096, usize::MAX] {
-        let mut streamed = Record::default();
-        let (streamed_summary, stats) =
-            decode_reader(Chunked::new(FIXTURE, chunk), &mut streamed).expect("decode_reader");
-        assert_eq!(streamed_summary, summary, "chunk {chunk}");
-        assert_eq!(streamed.info, whole.info, "chunk {chunk}");
-        assert_eq!(streamed.frames, whole.frames, "chunk {chunk}");
-        assert_eq!(stats.len, FIXTURE.len() as u64);
-        assert!(stats.peak_held <= FIXTURE.len(), "{stats:?}");
+    assert!(summary.peak_held <= FIXTURE.len(), "{summary:?}");
+    for chunk in [1, 7, 4096] {
+        let mut chunked = Record::default();
+        let chunked_summary = decode(Chunked::new(FIXTURE, chunk), &mut chunked).expect("decode");
+        assert_eq!(chunked_summary, summary, "chunk {chunk}");
+        assert_eq!(chunked.info, whole.info, "chunk {chunk}");
+        assert_eq!(chunked.frames, whole.frames, "chunk {chunk}");
     }
 }
 
 #[test]
-fn reader_reaches_the_slice_verdict_on_bad_input() {
+fn chunked_reads_reach_the_same_verdict_on_bad_input() {
     let mut corrupt = FIXTURE.to_vec();
     let middle = corrupt.len() / 2;
     corrupt[middle] ^= 0x01;
     let mut trailing = FIXTURE.to_vec();
     trailing.extend_from_slice(b"TAG trailing bytes");
     for input in [&corrupt[..], &trailing[..], &FIXTURE[..FIXTURE.len() - 1]] {
-        let expected = format!("{:?}", decode(input, &mut Record::default()));
-        let streamed = decode_reader(Chunked::new(input, 7), &mut Record::default())
-            .map(|(summary, _)| summary);
-        assert_eq!(format!("{streamed:?}"), expected);
+        let whole = format!("{:?}", decode(input, &mut Record::default()));
+        let chunked = decode(Chunked::new(input, 7), &mut Record::default());
+        assert_eq!(format!("{chunked:?}"), whole);
     }
 }
 
@@ -226,12 +223,11 @@ fn reader_error_ends_decoding() {
     let mut reader = Chunked::new(FIXTURE, 4096);
     reader.fail_at = Some(FIXTURE.len() / 2);
     let mut record = Record::default();
-    let error = decode_reader(reader, &mut record).expect_err("read error");
+    let error = decode(reader, &mut record).expect_err("read error");
     assert!(
         matches!(&error, Error::Read(error) if error.to_string() == "connection reset"),
         "{error:?}"
     );
-    assert!(!record.frames.is_empty());
 }
 
 #[test]
@@ -249,7 +245,7 @@ fn reader_panic_is_a_read_error() {
 
     let reader = Panicking(Chunked::new(FIXTURE, 4096));
     let mut record = Record::default();
-    let error = decode_reader(reader, &mut record).expect_err("panic");
+    let error = decode(reader, &mut record).expect_err("panic");
     assert!(
         matches!(&error, Error::Read(error) if error.to_string() == "the reader panicked"),
         "{error:?}"
@@ -273,6 +269,6 @@ fn reader_is_given_zeroed_buffers() {
 
     for chunk in [1, 4096, usize::MAX] {
         let reader = Inspecting(Chunked::new(FIXTURE, chunk));
-        decode_reader(reader, &mut Record::default()).expect("zeroed buffers");
+        decode(reader, &mut Record::default()).expect("zeroed buffers");
     }
 }

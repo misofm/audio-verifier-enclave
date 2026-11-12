@@ -34,9 +34,6 @@ pub enum Error {
     /// STREAMINFO total samples is zero.
     #[error("STREAMINFO total samples is zero")]
     ZeroTotalSamples,
-    /// 32-bit FLAC is excluded by the attestation policy.
-    #[error("32-bit FLAC is not supported")]
-    Unsupported32Bit,
     /// Bit depth outside 8, 16 and 24.
     #[error("unsupported bit depth {0}")]
     UnsupportedBitDepth(u8),

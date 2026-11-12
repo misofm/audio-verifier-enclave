@@ -11,7 +11,8 @@ use serde::{Deserialize, Serialize};
 
 pub use error::Error;
 pub use self_test::self_test;
-pub use streaminfo::StreamInfo;
+
+use streaminfo::StreamInfo;
 
 /// Bit depths the enclave attests.
 pub const SUPPORTED_BIT_DEPTHS: [u8; 3] = [8, 16, 24];
@@ -56,42 +57,36 @@ pub struct FileStats {
     pub peak_held: usize,
 }
 
-/// Measures a FLAC file into its Move-layout `AudioPayload`.
+/// Measures a FLAC file read front to back from `reader` into its Move-layout `AudioPayload`,
+/// holding only a bounded window of it, and returns the file's length and SHA-256 with it.
 ///
 /// STREAMINFO must be the first metadata block. PADDING, SEEKTABLE and VORBIS_COMMENT blocks may
 /// follow it, up to [`MAX_EXTRA_METADATA_BYTES`] in total, and are ignored: the facts describe
 /// the decoded audio only, so tags never change them.
-pub fn measure(bytes: &[u8]) -> Result<AudioPayload, Error> {
-    let (info, _) = stream::read_head(&mut &*bytes)?;
-    info.validate()?;
-    let pcm_digest = decode::verify_and_digest(bytes, &info)?;
-    Ok(payload(&info, pcm_digest))
-}
-
-/// Measures a FLAC file read front to back from `reader`, as [`measure`] does, holding only a
-/// bounded window of it. Also returns the file's length and SHA-256.
 pub fn measure_reader<R: Read>(reader: R) -> Result<(AudioPayload, FileStats), Error> {
     let mut reader = stream::Hashing::new(reader);
     let (info, head) = stream::read_head(&mut reader)?;
     info.validate()?;
     let input = Cursor::new(head).chain(&mut reader);
-    let (pcm_digest, read) = decode::verify_and_digest_reader(input, &info)?;
+    let (pcm_digest, summary) = decode::verify_and_digest(input, &info)?;
     let (len, sha256) = reader.finish();
-    debug_assert_eq!(len, read.len);
-    let stats = FileStats {
-        len,
-        sha256,
-        peak_held: read.peak_held,
-    };
-    Ok((payload(&info, pcm_digest), stats))
-}
-
-fn payload(info: &StreamInfo, pcm_digest: [u8; 32]) -> AudioPayload {
-    AudioPayload {
+    debug_assert_eq!(len, summary.len);
+    let audio = AudioPayload {
         channels: info.channels,
         bit_depth: info.bit_depth,
         sample_rate_hz: info.sample_rate_hz,
         samples_per_channel: info.total_samples,
         pcm_digest: pcm_digest.to_vec(),
-    }
+    };
+    let stats = FileStats {
+        len,
+        sha256,
+        peak_held: summary.peak_held,
+    };
+    Ok((audio, stats))
+}
+
+/// [`measure_reader`] over a file in memory, for its audio facts.
+pub fn measure(bytes: &[u8]) -> Result<AudioPayload, Error> {
+    measure_reader(bytes).map(|(audio, _)| audio)
 }

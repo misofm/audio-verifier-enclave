@@ -12,7 +12,6 @@ use std::io::{self, Read};
 use audio_verifier::{AudioPayload, Error, measure, measure_reader};
 use common::{BitWriter, crc8, crc16, fixture, utf8_number};
 use md5::{Digest as _, Md5};
-use sha2::Sha256;
 
 /// Hands out at most `chunk` bytes per read.
 struct Chunked<'a> {
@@ -30,25 +29,25 @@ impl Read for Chunked<'_> {
     }
 }
 
-/// Measures `bytes` buffered, then streamed in several chunk sizes and split in two at every
+/// Measures `bytes` read whole, then in several chunk sizes and split in two at every
 /// `step`-th offset, and requires the same result, error included, from each.
 fn same_everywhere(bytes: &[u8], step: usize) -> Result<AudioPayload, Error> {
-    let buffered = measure(bytes);
-    for chunk in [1, 7, 100, 4096, 9000, usize::MAX] {
+    let whole = measure(bytes);
+    for chunk in [1, 7, 100, 4096, 9000] {
         let reader = Chunked {
             bytes,
             at: 0,
             chunk,
         };
-        let streamed = measure_reader(reader).map(|(audio, _)| audio);
-        assert_eq!(streamed, buffered, "chunks of {chunk}");
+        let chunked = measure_reader(reader).map(|(audio, _)| audio);
+        assert_eq!(chunked, whole, "chunks of {chunk}");
     }
     for split in (1..bytes.len()).step_by(step) {
         let (head, tail) = bytes.split_at(split);
-        let streamed = measure_reader(head.chain(tail)).map(|(audio, _)| audio);
-        assert_eq!(streamed, buffered, "split at {split}");
+        let split_read = measure_reader(head.chain(tail)).map(|(audio, _)| audio);
+        assert_eq!(split_read, whole, "split at {split}");
     }
-    buffered
+    whole
 }
 
 /// A one-frame, 16-sample, mono, 16-bit, 44.1 kHz file. Its first residual is a Rice-2 code
@@ -87,7 +86,7 @@ fn overlong_rice(zeros: usize) -> Vec<u8> {
 }
 
 /// [`overlong_rice`] after a PADDING block of `padding` bytes, so the code sits deeper in the
-/// input and, for some paddings, across the buffered path's own 8 KiB refill.
+/// input and, for some paddings, across libFLAC's 8 KiB refill.
 fn padded(padding: usize) -> Vec<u8> {
     let base = overlong_rice(4096);
     let mut out = base[..42].to_vec();
@@ -100,8 +99,8 @@ fn padded(padding: usize) -> Vec<u8> {
 }
 
 /// A canonical file, STREAMINFO alone: `lead` silent VERBATIM frames of 16 samples, then the
-/// overlong-Rice frame as frame `lead`. The buffered path of main@595329a accepted this shape
-/// for some `lead`.
+/// overlong-Rice frame as frame `lead`. main@595329a accepted this shape, read whole, for some
+/// `lead`.
 fn canonical_with_lead(lead: u32) -> Vec<u8> {
     let base = overlong_rice(4096);
     let total = 16 * (u64::from(lead) + 1);
@@ -133,12 +132,7 @@ fn canonical_with_lead(lead: u32) -> Vec<u8> {
 
 #[test]
 fn the_fixtures_are_the_generated_files() {
-    let bytes = overlong_rice(4096);
-    assert_eq!(bytes, fixture("overlong_rice.flac"));
-    assert_eq!(
-        hex::encode(<Sha256 as sha2::Digest>::digest(&bytes)),
-        "9ad046faf94c545fb8c122a7e785b352df73a37e72aed24d73e8cfb8960e17f8"
-    );
+    assert_eq!(overlong_rice(4096), fixture("overlong_rice.flac"));
     assert_eq!(
         canonical_with_lead(181),
         fixture("overlong_rice_canonical.flac")

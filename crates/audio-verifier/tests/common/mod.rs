@@ -1,7 +1,6 @@
 #![allow(dead_code)]
 
 use std::{
-    env,
     path::{Path, PathBuf},
     process::Command,
 };
@@ -18,16 +17,12 @@ pub fn fixture(name: &str) -> Vec<u8> {
     std::fs::read(fixture_path(name)).expect("fixture")
 }
 
-pub fn ffmpeg() -> Option<PathBuf> {
-    let candidate = env::var_os("FFMPEG")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/usr/bin/ffmpeg"));
-    Command::new(&candidate)
+/// Whether `ffmpeg` runs, for the optional cross-checks against an independent decoder.
+pub fn has_ffmpeg() -> bool {
+    Command::new("ffmpeg")
         .arg("-version")
         .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .map(|_| candidate)
+        .is_ok_and(|output| output.status.success())
 }
 
 pub fn scratch_file(name: &str, bytes: &[u8]) -> PathBuf {
@@ -44,7 +39,7 @@ pub fn scratch_file(name: &str, bytes: &[u8]) -> PathBuf {
     path
 }
 
-pub fn ffmpeg_raw_pcm(ffmpeg: &Path, flac: &Path, bit_depth: u8) -> Vec<u8> {
+pub fn ffmpeg_raw_pcm(flac: &Path, bit_depth: u8) -> Vec<u8> {
     let format = match bit_depth {
         8 => "s8",
         16 => "s16le",
@@ -56,7 +51,7 @@ pub fn ffmpeg_raw_pcm(ffmpeg: &Path, flac: &Path, bit_depth: u8) -> Vec<u8> {
         16 => "pcm_s16le",
         _ => "pcm_s24le",
     };
-    let output = Command::new(ffmpeg)
+    let output = Command::new("ffmpeg")
         .args([
             "-hide_banner",
             "-loglevel",
