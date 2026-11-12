@@ -61,8 +61,6 @@ RUN mkdir -p .cargo && cp vendor/config.toml .cargo/config.toml
 ENV SOURCE_DATE_EPOCH=0
 ENV TARGET=x86_64-unknown-linux-musl
 ENV RUSTFLAGS="-C target-feature=+crt-static -C relocation-model=static -C target-cpu=x86-64-v4 -C target-feature=+gfni"
-ARG ENCLAVE_PACKAGE=audio-verifier-enclave
-ARG ENCLAVE_BIN=audio-verifier-enclave
 
 # StageX Rust 1.94.0 links build scripts and final musl binaries through
 # libunwind names that core-libunwind does not ship: it has only
@@ -72,8 +70,8 @@ RUN ln -sf /usr/lib/gcc/x86_64-linux-musl/15.2.0/libgcc_eh.a /usr/lib/libunwind.
 	&& ln -sf libunwind.so.1 /usr/lib/libunwind.so.8 \
 	&& ln -sf libunwind.so.1 /lib64/libunwind.so \
 	&& ln -sf libunwind.so.1 /lib64/libunwind.so.8
-RUN sh scripts/assert-no-test-utils.sh "$ENCLAVE_PACKAGE" "$TARGET"
-RUN cargo build --locked --release --target "$TARGET" -p "$ENCLAVE_PACKAGE"
+RUN sh scripts/assert-no-test-utils.sh
+RUN cargo build --locked --release --target "$TARGET" -p audio-verifier-enclave
 
 WORKDIR /build_cpio
 ENV KBUILD_BUILD_TIMESTAMP=1
@@ -81,7 +79,7 @@ RUN mkdir initramfs
 COPY --from=core-busybox . initramfs
 COPY --from=core-musl . initramfs
 COPY --from=user-nit /bin/init initramfs/init
-RUN cp "/workspace/target/${TARGET}/release/${ENCLAVE_BIN}" initramfs/nautilus-app
+RUN cp "/workspace/target/${TARGET}/release/audio-verifier-enclave" initramfs/nautilus-app
 RUN cp /workspace/eif/run.sh initramfs/run.sh
 RUN chmod +x initramfs/nautilus-app initramfs/run.sh
 

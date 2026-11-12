@@ -4,13 +4,12 @@
 
 use std::path::Path;
 
-use audio_verifier_enclave::{DEFAULT_MAX_BODY_BYTES, MEASURE_JOB_BYTES, app};
+use audio_verifier_enclave::{Limits, MAX_FILE_BYTES, MEASURE_JOB_BYTES, app};
 use axum::{
     Router,
-    body::{Body, Bytes},
+    body::{Body, Bytes, to_bytes},
     http::{Request, StatusCode, header},
 };
-use http_body_util::BodyExt as _;
 use nautilus::{EnclaveIdentity, NautilusContext, testing::FakeAttestor};
 use tower::ServiceExt as _;
 
@@ -69,7 +68,7 @@ fn unterminated(total: usize) -> Request<Body> {
     });
     Request::builder()
         .method("POST")
-        .uri("/v1/measure")
+        .uri("/measure")
         .header(header::CONTENT_LENGTH, total)
         .body(Body::from_stream(stream))
         .expect("request")
@@ -78,12 +77,9 @@ fn unterminated(total: usize) -> Request<Body> {
 async fn send(router: &Router, request: Request<Body>) -> (StatusCode, serde_json::Value) {
     let response = router.clone().oneshot(request).await.expect("response");
     let status = response.status();
-    let bytes = response
-        .into_body()
-        .collect()
+    let bytes = to_bytes(response.into_body(), usize::MAX)
         .await
-        .expect("body")
-        .to_bytes();
+        .expect("body");
     (status, serde_json::from_slice(&bytes).expect("JSON"))
 }
 
@@ -93,9 +89,9 @@ async fn unterminated_frames_cost_a_window_each() {
         EnclaveIdentity::from_seed([9u8; 32]),
         FakeAttestor::default(),
     );
-    let router = app(ctx, DEFAULT_MAX_BODY_BYTES, 2);
+    let router = app(ctx, Limits::new(2));
     let before = peak_rss_kib();
-    let total = DEFAULT_MAX_BODY_BYTES;
+    let total = MAX_FILE_BYTES as usize;
     let (first, second) = tokio::join!(
         send(&router, unterminated(total)),
         send(&router, unterminated(total))

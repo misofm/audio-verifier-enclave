@@ -1,5 +1,3 @@
 .git
 target
 out
-crates/*/target
-move

@@ -1,69 +1,34 @@
-#[cfg(not(feature = "dev"))]
-mod cpu;
+use std::{error::Error, fs, num::NonZeroUsize, thread, time::Duration};
 
-use std::env;
+use audio_verifier_enclave::{Limits, app, measure_jobs, mem_total};
+use nautilus::{NautilusContext, ServerConfig};
 
-use audio_verifier_enclave::{
-    MAX_BODY_BYTES_ENV, Resources, app, max_body_bytes, measure_concurrency, server_config,
-};
-use nautilus::NautilusContext;
-
-#[cfg(not(feature = "dev"))]
 const VSOCK_PORT: u32 = 3000;
 
-#[cfg(feature = "dev")]
-const LISTEN_ADDR: &str = "127.0.0.1:3000";
-
-#[cfg(not(feature = "dev"))]
-fn context() -> anyhow::Result<NautilusContext> {
-    Ok(NautilusContext::from_runtime()?)
-}
-
-#[cfg(feature = "dev")]
-fn context() -> anyhow::Result<NautilusContext> {
-    Ok(NautilusContext::development())
-}
-
-fn main() -> anyhow::Result<()> {
-    #[cfg(not(feature = "dev"))]
-    cpu::require_avx512();
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
     audio_verifier::self_test()?;
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?
-        .block_on(serve())
-}
-
-async fn serve() -> anyhow::Result<()> {
-    let args: Vec<String> = env::args().skip(1).collect();
-    let max_body_bytes = max_body_bytes(&args, env::var(MAX_BODY_BYTES_ENV).ok())?;
-    let ctx = context()?;
-    println!("[nautilus] attestor:   {}", ctx.attestor_name());
-    println!("[nautilus] public key: {}", ctx.public_key_hex());
-    println!("[nautilus] address:    {}", ctx.sui_address());
-    let config = server_config();
-    let resources = Resources::detect();
-    let measure_concurrent = measure_concurrency(resources);
-    let app = app(ctx, max_body_bytes, measure_concurrent);
-    println!("[server] max body bytes: {max_body_bytes}");
+    let ctx = NautilusContext::from_runtime()?;
+    let cpus = thread::available_parallelism().map_or(1, NonZeroUsize::get);
+    let memory = fs::read_to_string("/proc/meminfo")
+        .ok()
+        .as_deref()
+        .and_then(mem_total);
+    let jobs = measure_jobs(cpus, memory);
+    println!("[server] public key: {}", ctx.public_key_hex());
     println!(
-        "[server] /v1/measure jobs: {measure_concurrent} ({} vCPUs, MemTotal {} MiB)",
-        resources
-            .cpus
-            .map_or_else(|| "unknown".into(), |cpus| cpus.to_string()),
-        resources
-            .memory_bytes
-            .map_or_else(|| "unknown".into(), |bytes| (bytes >> 20).to_string()),
+        "[server] /measure jobs: {jobs} ({cpus} vCPUs, MemTotal {} MiB)",
+        memory.map_or_else(|| "unknown".into(), |bytes| (bytes >> 20).to_string())
     );
-    #[cfg(feature = "dev")]
-    {
-        println!("[server] listening on http://{LISTEN_ADDR}");
-        nautilus::serve(LISTEN_ADDR.parse()?, app, config).await?;
-    }
-    #[cfg(not(feature = "dev"))]
-    {
-        println!("[server] listening on vsock port {VSOCK_PORT}");
-        nautilus::serve_vsock(VSOCK_PORT, app, config).await?;
-    }
+    // `serve_vsock` reads only the connection limits. 256 connections match the host bridge;
+    // fewer let a few idle connections lock out every request until the header timeout.
+    let config = ServerConfig {
+        max_connections: 256,
+        header_read_timeout: Duration::from_secs(10),
+        idle_timeout: Duration::from_secs(30),
+        ..ServerConfig::default()
+    };
+    println!("[server] listening on vsock port {VSOCK_PORT}");
+    nautilus::serve_vsock(VSOCK_PORT, app(ctx, Limits::new(jobs)), config).await?;
     Ok(())
 }

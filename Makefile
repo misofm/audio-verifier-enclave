@@ -1,7 +1,4 @@
-REGISTRY ?= local
 OUT_DIR ?= out
-ENCLAVE_PACKAGE ?= audio-verifier-enclave
-ENCLAVE_BIN ?= $(ENCLAVE_PACKAGE)
 ENCLAVE_CID ?= 16
 ENCLAVE_CPUS ?= 4
 ENCLAVE_MEMORY ?= 6144M
@@ -20,14 +17,11 @@ $(OUT_DIR)/nitro.eif: $(EIF_INPUTS) | $(OUT_DIR)
 	mv vendor.toml vendor/config.toml
 	docker build \
 		--pull \
-		--tag $(REGISTRY)/audio-verifier-enclave \
 		--progress=plain \
 		--platform linux/amd64 \
 		--provenance=false \
 		--output type=local,rewrite-timestamp=true,dest=$(OUT_DIR) \
 		-f Containerfile.eif \
-		--build-arg ENCLAVE_PACKAGE=$(ENCLAVE_PACKAGE) \
-		--build-arg ENCLAVE_BIN=$(ENCLAVE_BIN) \
 		.
 
 .PHONY: run-eif
@@ -40,7 +34,7 @@ run-eif: $(OUT_DIR)/nitro.eif
 
 .PHONY: run-eif-debug
 run-eif-debug: $(OUT_DIR)/nitro.eif
-	@echo 'WARNING: debug mode reports all-zero PCRs; this enclave cannot be attested or registered with Kagi.' >&2
+	@echo 'WARNING: debug mode reports all-zero PCRs; this enclave cannot be attested or registered on chain.' >&2
 	sudo nitro-cli run-enclave \
 		--cpu-count $(ENCLAVE_CPUS) \
 		--memory $(ENCLAVE_MEMORY) \
