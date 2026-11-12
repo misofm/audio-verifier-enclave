@@ -1,6 +1,6 @@
 [package]
 name = "audio-verifier-enclave"
-description = "Nautilus enclave service that measures and signs canonical FLAC audio"
+description = "Nautilus enclave service that measures and signs FLAC audio"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

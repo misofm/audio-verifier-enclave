@@ -1,6 +1,6 @@
 [package]
 name = "audio-verifier"
-description = "Measures canonical FLAC audio into the Move audio::audio::Audio layout"
+description = "Measures FLAC audio into the Move audio::audio::Audio layout"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

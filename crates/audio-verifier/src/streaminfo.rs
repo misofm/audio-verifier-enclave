@@ -13,7 +13,7 @@ const PACKED_OFFSET: usize = 18;
 const MD5_OFFSET: usize = 26;
 const MIN_BLOCK_SIZE_FLOOR: u16 = 16;
 
-/// STREAMINFO fields of a canonical FLAC file.
+/// STREAMINFO fields of a FLAC file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StreamInfo {
     /// Smallest block size in samples, excluding the last block.

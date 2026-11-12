@@ -2,7 +2,7 @@ mod common;
 
 use std::io::{self, Read};
 
-use audio_verifier::{AudioPayload, Error, FileStats, measure_reader};
+use audio_verifier::{AudioPayload, Error, FileStats, MAX_EXTRA_METADATA_BYTES, measure_reader};
 use common::{
     FrameEdit, FrameHeader, Rate, Synth, block_sizes, decoded_samples, ffmpeg, ffmpeg_raw_pcm,
     fixture, frame_sizes, pcm_md5, scratch_file, set_block_sizes, set_frame_sizes, set_md5,
@@ -241,21 +241,210 @@ fn frame_rate_encodings_equal_to_streaminfo_are_accepted() {
     }
 }
 
+/// `canonical` with `blocks` of `(type, body)` inserted after STREAMINFO.
+fn with_metadata(canonical: &[u8], blocks: &[(u8, Vec<u8>)]) -> Vec<u8> {
+    let mut out = canonical[..42].to_vec();
+    out[4] &= 0x7f;
+    for (index, (block_type, body)) in blocks.iter().enumerate() {
+        let last = if index + 1 == blocks.len() { 0x80 } else { 0 };
+        out.push(block_type | last);
+        out.extend_from_slice(&(body.len() as u32).to_be_bytes()[1..]);
+        out.extend_from_slice(body);
+    }
+    out.extend_from_slice(&canonical[42..]);
+    out
+}
+
+/// What `@misofm/codec` and libFLAC write: libFLAC's vendor string and no comments.
+fn codec_comment() -> Vec<u8> {
+    let vendor = b"reference libFLAC 1.5.0 20250211";
+    let mut body = (vendor.len() as u32).to_le_bytes().to_vec();
+    body.extend_from_slice(vendor);
+    body.extend_from_slice(&0u32.to_le_bytes());
+    body
+}
+
+fn tagged_comment() -> Vec<u8> {
+    let mut body = codec_comment();
+    body.truncate(body.len() - 4);
+    let comments = [&b"TITLE=Pink noise"[..], b"ARTIST=Nobody"];
+    body.extend_from_slice(&(comments.len() as u32).to_le_bytes());
+    for comment in comments {
+        body.extend_from_slice(&(comment.len() as u32).to_le_bytes());
+        body.extend_from_slice(comment);
+    }
+    body
+}
+
+/// Seek points at the first `count` frames: sample number, byte offset, samples.
+fn seektable(count: u64) -> Vec<u8> {
+    let mut body = Vec::new();
+    for point in 0..count {
+        body.extend_from_slice(&(point * 1_024).to_be_bytes());
+        body.extend_from_slice(&0u64.to_be_bytes());
+        body.extend_from_slice(&1_024u16.to_be_bytes());
+    }
+    body
+}
+
+const PADDING: u8 = 1;
+const APPLICATION: u8 = 2;
+const SEEKTABLE: u8 = 3;
+const VORBIS_COMMENT: u8 = 4;
+const CUESHEET: u8 = 5;
+const PICTURE: u8 = 6;
+
 #[test]
-fn rejects_vorbis_comment_after_streaminfo() {
-    let mut bytes = fixture("s16_stereo_44100.flac");
-    bytes[4] = 0x00;
-    let comment = [0x84, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0];
-    bytes.splice(42..42, comment);
-    assert_eq!(rejects(&bytes), Error::ExtraMetadata);
+fn tags_padding_and_seektables_do_not_change_the_audio() {
+    for name in ["s16_stereo_44100.flac", "libflac_s24_stereo_96000.flac"] {
+        let canonical = fixture(name);
+        let expected = measure(&canonical).expect("canonical");
+        for blocks in [
+            vec![(VORBIS_COMMENT, codec_comment())],
+            vec![(VORBIS_COMMENT, tagged_comment())],
+            vec![(VORBIS_COMMENT, vec![0; 8])],
+            vec![(PADDING, vec![0; 4])],
+            vec![(PADDING, Vec::new())],
+            vec![(SEEKTABLE, seektable(3))],
+            vec![
+                (SEEKTABLE, seektable(2)),
+                (VORBIS_COMMENT, codec_comment()),
+                (PADDING, vec![0; 8_192]),
+            ],
+        ] {
+            let tagged = with_metadata(&canonical, &blocks);
+            assert_eq!(measure(&tagged), Ok(expected.clone()), "{name}: {blocks:?}");
+        }
+    }
+}
+
+/// `bytes` with every metadata block after STREAMINFO removed.
+fn strip_metadata(bytes: &[u8]) -> Vec<u8> {
+    let mut offset = 4;
+    loop {
+        let header = bytes[offset];
+        let length =
+            u32::from_be_bytes([0, bytes[offset + 1], bytes[offset + 2], bytes[offset + 3]]);
+        offset += 4 + length as usize;
+        if header & 0x80 != 0 {
+            break;
+        }
+    }
+    let mut out = bytes[..42].to_vec();
+    out[4] |= 0x80;
+    out.extend_from_slice(&bytes[offset..]);
+    out
 }
 
 #[test]
-fn rejects_padding_after_streaminfo() {
-    let mut bytes = fixture("s16_stereo_44100.flac");
-    bytes[4] = 0x00;
-    bytes.splice(42..42, [0x81, 0, 0, 4, 0, 0, 0, 0]);
-    assert_eq!(rejects(&bytes), Error::ExtraMetadata);
+fn ffmpeg_output_with_its_tags_is_measured_as_without_them() {
+    let Some(ffmpeg) = ffmpeg() else {
+        eprintln!("ffmpeg unavailable, skipping the tagged ffmpeg file");
+        return;
+    };
+    let path = scratch_file("tagged.flac", &[]);
+    let status = std::process::Command::new(ffmpeg)
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+        ])
+        .arg("aevalsrc=0.5*sin(2*PI*440*t)|0.4*sin(2*PI*660*t):s=48000:d=0.25")
+        .args([
+            "-metadata",
+            "title=Two tones",
+            "-c:a",
+            "flac",
+            "-sample_fmt",
+            "s16",
+        ])
+        .arg(&path)
+        .status()
+        .expect("ffmpeg");
+    assert!(status.success());
+    let tagged = std::fs::read(&path).expect("ffmpeg output");
+    assert_eq!(
+        tagged[4] & 0x80,
+        0,
+        "ffmpeg wrote metadata after STREAMINFO"
+    );
+    let expected = measure(&strip_metadata(&tagged)).expect("stripped");
+    assert_eq!(measure(&tagged), Ok(expected));
+}
+
+#[test]
+fn metadata_may_fill_its_limit_but_not_exceed_it() {
+    let canonical = fixture("s16_stereo_44100.flac");
+    let expected = measure(&canonical).expect("canonical");
+    let limit = MAX_EXTRA_METADATA_BYTES as usize;
+    let full = with_metadata(&canonical, &[(PADDING, vec![0; limit - 4])]);
+    assert_eq!(measure(&full), Ok(expected.clone()));
+    let comment = codec_comment();
+    let padding = limit - 8 - comment.len();
+    let split = with_metadata(
+        &canonical,
+        &[(VORBIS_COMMENT, comment), (PADDING, vec![0; padding])],
+    );
+    assert_eq!(measure(&split), Ok(expected));
+    let over = with_metadata(&canonical, &[(PADDING, vec![0; limit - 3])]);
+    assert_eq!(rejects(&over), Error::MetadataTooLong);
+    let many = with_metadata(&canonical, &vec![(PADDING, vec![0; 1_020]); 65]);
+    assert_eq!(rejects(&many), Error::MetadataTooLong);
+    // The declared length is checked before the block is read.
+    let mut huge = canonical[..42].to_vec();
+    huge[4] &= 0x7f;
+    huge.extend_from_slice(&[0x81, 0xff, 0xff, 0xff]);
+    assert_eq!(rejects(&huge), Error::MetadataTooLong);
+    assert!(
+        Error::MetadataTooLong
+            .to_string()
+            .contains(&limit.to_string())
+    );
+}
+
+#[test]
+fn rejects_other_metadata_after_streaminfo() {
+    let canonical = fixture("s16_stereo_44100.flac");
+    for block_type in [0, APPLICATION, CUESHEET, PICTURE, 7, 126, 127] {
+        let bytes = with_metadata(&canonical, &[(block_type, vec![0; 64])]);
+        assert_eq!(rejects(&bytes), Error::MetadataBlock(block_type));
+        let after_tags = with_metadata(
+            &canonical,
+            &[(VORBIS_COMMENT, codec_comment()), (block_type, vec![0; 64])],
+        );
+        assert_eq!(rejects(&after_tags), Error::MetadataBlock(block_type));
+    }
+    assert!(
+        Error::MetadataBlock(PICTURE)
+            .to_string()
+            .contains("only PADDING, SEEKTABLE and VORBIS_COMMENT")
+    );
+}
+
+#[test]
+fn rejects_malformed_or_truncated_metadata() {
+    let canonical = fixture("s16_stereo_44100.flac");
+    // A seek table that is not a whole number of 18-byte points.
+    let seektable = with_metadata(&canonical, &[(SEEKTABLE, vec![0; 17])]);
+    assert_eq!(rejects(&seektable), Error::SeekTableLength(17));
+    // The last-block flag is clear, but no block follows: the first frame's sync code is read
+    // as a block header of type 127.
+    let mut unflagged = canonical.clone();
+    unflagged[4] &= 0x7f;
+    assert_eq!(rejects(&unflagged), Error::MetadataBlock(127));
+    let tagged = with_metadata(&canonical, &[(VORBIS_COMMENT, codec_comment())]);
+    let end = 42 + 4 + codec_comment().len();
+    for len in [43, 45, 46, 60, end - 1] {
+        assert_eq!(
+            rejects(&tagged[..len]),
+            Error::TooShort(len),
+            "length {len}"
+        );
+    }
 }
 
 #[test]
@@ -829,6 +1018,7 @@ fn rejects_excessive_decoded_work_before_decoding() {
     bytes[21] |= 0x0f;
     bytes[22..26].fill(0xff);
     assert_eq!(rejects(&bytes), Error::DecodedTooLarge);
+    assert!(Error::DecodedTooLarge.to_string().contains("4 GiB"));
     // Rejected from STREAMINFO alone: the frames are never read.
     assert_eq!(rejects(&bytes[..42]), Error::DecodedTooLarge);
 }

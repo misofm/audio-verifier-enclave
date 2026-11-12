@@ -12,9 +12,19 @@ pub enum Error {
     /// First metadata block is not STREAMINFO.
     #[error("first metadata block has type {0}, expected STREAMINFO")]
     WrongFirstBlock(u8),
-    /// STREAMINFO is followed by other metadata blocks.
-    #[error("STREAMINFO must be the only metadata block")]
-    ExtraMetadata,
+    /// A metadata block other than PADDING, SEEKTABLE or VORBIS_COMMENT follows STREAMINFO.
+    #[error(
+        "metadata block type {0} is not accepted: only PADDING, SEEKTABLE and VORBIS_COMMENT \
+         may follow STREAMINFO"
+    )]
+    MetadataBlock(u8),
+    /// The metadata blocks after STREAMINFO exceed
+    /// [`MAX_EXTRA_METADATA_BYTES`](crate::MAX_EXTRA_METADATA_BYTES).
+    #[error("metadata after STREAMINFO exceeds 65536 bytes")]
+    MetadataTooLong,
+    /// A SEEKTABLE block is not a whole number of 18-byte seek points.
+    #[error("SEEKTABLE length is {0}, not a multiple of 18")]
+    SeekTableLength(u32),
     /// STREAMINFO block length is not 34.
     #[error("STREAMINFO length is {0}, expected 34")]
     StreamInfoLength(u32),

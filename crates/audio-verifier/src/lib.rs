@@ -38,6 +38,9 @@ pub struct AudioPayload {
     pub pcm_digest: Vec<u8>,
 }
 
+/// Most bytes of metadata blocks after STREAMINFO, their 4-byte headers included (64 KiB).
+pub const MAX_EXTRA_METADATA_BYTES: u32 = 64 * 1024;
+
 /// Most decoded PCM per file, all channels included (4 GiB), checked from STREAMINFO before
 /// decoding: a small compressed file could otherwise expand to terabytes of hashing work.
 pub const MAX_DECODED_BYTES: u64 = 4 * 1024 * 1024 * 1024;
@@ -53,7 +56,11 @@ pub struct FileStats {
     pub peak_held: usize,
 }
 
-/// Measures a canonical FLAC file into its Move-layout `AudioPayload`.
+/// Measures a FLAC file into its Move-layout `AudioPayload`.
+///
+/// STREAMINFO must be the first metadata block. PADDING, SEEKTABLE and VORBIS_COMMENT blocks may
+/// follow it, up to [`MAX_EXTRA_METADATA_BYTES`] in total, and are ignored: the facts describe
+/// the decoded audio only, so tags never change them.
 pub fn measure(bytes: &[u8]) -> Result<AudioPayload, Error> {
     let (info, _) = stream::read_head(&mut &*bytes)?;
     info.validate()?;

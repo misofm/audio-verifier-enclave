@@ -3,7 +3,17 @@ use std::io::{self, Read};
 use sha2::{Digest as _, Sha256};
 
 use crate::streaminfo::HEADER_LENGTH;
-use crate::{Error, StreamInfo};
+use crate::{Error, MAX_EXTRA_METADATA_BYTES, StreamInfo};
+
+const PADDING: u8 = 1;
+const SEEKTABLE: u8 = 3;
+const VORBIS_COMMENT: u8 = 4;
+
+/// Metadata block types that may follow STREAMINFO. None of them can change the decoded audio,
+/// and libFLAC reads past them without reporting them.
+const SKIPPED_BLOCK_TYPES: [u8; 3] = [PADDING, SEEKTABLE, VORBIS_COMMENT];
+
+const SEEK_POINT_LENGTH: u32 = 18;
 
 /// Counts and hashes every byte read through it.
 pub(crate) struct Hashing<R> {
@@ -51,13 +61,42 @@ fn fill(reader: &mut impl Read, buffer: &mut [u8]) -> Result<usize, Error> {
 }
 
 /// Reads the `fLaC` marker and the metadata, returning STREAMINFO and every byte read.
+///
+/// STREAMINFO must come first. Blocks of [`SKIPPED_BLOCK_TYPES`] may follow it, up to
+/// [`MAX_EXTRA_METADATA_BYTES`] in total with their headers; any other block is rejected.
 pub(crate) fn read_head(reader: &mut impl Read) -> Result<(StreamInfo, Vec<u8>), Error> {
     let mut head = vec![0; HEADER_LENGTH];
     let filled = fill(reader, &mut head)?;
     head.truncate(filled);
-    let (info, last) = StreamInfo::parse(&head)?;
-    if !last {
-        return Err(Error::ExtraMetadata);
+    let (info, mut last) = StreamInfo::parse(&head)?;
+    let mut extra = 0u32;
+    while !last {
+        let mut header = [0; 4];
+        let filled = fill(reader, &mut header)?;
+        if filled < header.len() {
+            return Err(Error::TooShort(head.len() + filled));
+        }
+        head.extend_from_slice(&header);
+        last = header[0] & 0x80 != 0;
+        let block_type = header[0] & 0x7f;
+        if !SKIPPED_BLOCK_TYPES.contains(&block_type) {
+            return Err(Error::MetadataBlock(block_type));
+        }
+        let length = u32::from_be_bytes([0, header[1], header[2], header[3]]);
+        // libFLAC parses seek tables even when it skips them, and fails on a partial point.
+        if block_type == SEEKTABLE && !length.is_multiple_of(SEEK_POINT_LENGTH) {
+            return Err(Error::SeekTableLength(length));
+        }
+        extra += 4 + length;
+        if extra > MAX_EXTRA_METADATA_BYTES {
+            return Err(Error::MetadataTooLong);
+        }
+        let start = head.len();
+        head.resize(start + length as usize, 0);
+        let filled = fill(reader, &mut head[start..])?;
+        if filled < length as usize {
+            return Err(Error::TooShort(start + filled));
+        }
     }
     Ok((info, head))
 }
