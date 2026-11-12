@@ -67,5 +67,5 @@ src/libFLAC/stream_decoder.c
 EOF
 
 for patch in "$root"/crates/libflac/patches/*.patch; do
-	patch -d "$dest" -p1 --no-backup-if-mismatch --forward < "$patch"
+	patch -d "$dest" -p1 --fuzz=0 --no-backup-if-mismatch --forward < "$patch"
 done
