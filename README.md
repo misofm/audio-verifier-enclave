@@ -12,9 +12,10 @@ The service accepts FLAC files with:
 - After it, only PADDING, SEEKTABLE and VORBIS_COMMENT blocks, at most 64 KiB in total including their 4-byte headers. Any other block type (APPLICATION, CUESHEET, PICTURE or a reserved type), more metadata, or a SEEKTABLE that is not whole 18-byte seek points is rejected.
 - 8-, 16-, or 24-bit samples.
 - Sample rates of 44.1, 48, 88.2, 96, 176.4, 192, 352.8, or 384 kHz.
+- Frames of at most 16,777,215 bytes (2^24 - 1, the most STREAMINFO's `max_frame_size` can declare). No encoder writes frames near that size; larger ones are rejected on both routes.
 - Metadata and frame contents that agree with the decoded audio, and no bytes after the last frame.
 
-Accepted metadata blocks are ignored: the audio facts describe the decoded PCM only, so a file measures exactly as its copy with tags and padding removed. The file binding (intent 2) does cover them, because it hashes the file's bytes.
+Accepted metadata blocks are ignored: the audio facts describe the decoded PCM only, so a file measures exactly as its copy with tags and padding removed. The file binding (intent 2) does cover them, because it hashes the file's bytes. The blocks are not otherwise checked against the specification: a repeated SEEKTABLE or VORBIS_COMMENT is accepted, and so is PADDING that is not zero, which can carry up to 64 KiB of arbitrary bytes. None of it reaches the decoded audio.
 
 Files default to a 256 MiB limit. Decoded PCM is limited to 4 GiB across all channels, checked from STREAMINFO before any frame is decoded. Non-FLAC files and invalid audio are rejected without a signature.
 
@@ -29,7 +30,7 @@ The service serves HTTP: on vsock port 3000 in an enclave, and on `127.0.0.1:300
 | `POST /attestation` | `{ "nonce": hex }` | `{ "attestation": hex }`, the NSM document binding `public_key` |
 | `GET /health_check` | | `{ "pk", "address" }` |
 
-`/health_check`, `/attestation` and `/process_data` come from Nautilus. `/v1/measure` decodes the file as it arrives, holding about 1 MiB of it whatever its size, and stops reading as soon as the file is rejected. A response from it looks like this:
+`/health_check`, `/attestation` and `/process_data` come from Nautilus. `/v1/measure` decodes the file as it arrives, holding about 1 MiB of it for typical frames and never more than about 17 MiB, whatever its size, and stops reading as soon as the file is rejected. Both routes give the decoder the same reads, so a file gets the same verdict and error from either, however its body is chunked. A response from it looks like this:
 
 ```json
 {
@@ -54,10 +55,10 @@ Limits and errors:
 | | `/v1/measure` | `/process_data` |
 |---|---|---|
 | File size | `Content-Length` required (411 `length_required`); over the limit, 413 `body_too_large` | over the limit, 413 `body_too_large` |
-| Concurrency | 2 measurements, independent of `/process_data`; more get 429 `overloaded` | 1 upload, shared with `/attestation`; more get 429 `overloaded` |
-| Body | nothing received for 30 s: 408 `body_read_timeout`; a read error, or other than `Content-Length` bytes: 400 `body_read_failed` | not received within 90 s: 408 `body_read_timeout` |
+| Concurrency | one measurement per vCPU, fewer if memory is short (see [Sizing the enclave](#sizing-the-enclave)), independent of `/process_data`; more get 429 `overloaded` | 1 upload, shared with `/attestation`; more get 429 `overloaded` |
+| Body | nothing received for 30 s: 408 `body_read_timeout`; a read error, or other than `Content-Length` bytes: 400 `body_read_failed`. A body that trickles in just faster than that keeps its permit until the request deadline | not received within 90 s: 408 `body_read_timeout` |
 | Request | 600 s for the body and the measurement: 408 `request_timeout` | 120 s: 408 `request_timeout` |
-| Memory per request | about 1 MiB of the file, plus 16 queued body chunks | the whole file |
+| Memory per request | about 1 MiB of the file for typical frames, and 2 MiB in all, or about 10 MiB when the client sends faster than the decoder and the 16 queued body chunks fill; at most 48 MiB: a 17 MiB window, PCM and libFLAC buffers, and the queue | the whole file, up to twice that while its chunks are joined, and the decode |
 | Rejected file | 422 `application_error`, the reason in `message` | 422 `application_error`, the reason in `message` |
 
 Set the file size limit, for both routes, with `--max-body-bytes` or `AUDIO_VERIFIER_MAX_BODY_BYTES`; it defaults to 256 MiB. The service also closes connections beyond 256, connections whose request headers take more than 10 s, and idle connections after 30 s.
@@ -124,7 +125,36 @@ make eif
 make run-eif
 ```
 
-The image is written to `out/nitro.eif`. The default enclave allocation is four vCPUs and 6144 MiB of memory. Bridge clients to vsock port 3000 through the parent instance, and register the image's PCR measurements through the Move enclave policy before using its signatures on-chain. Never enable the `dev` feature in a production image.
+The image is written to `out/nitro.eif`. The default enclave allocation is four vCPUs and 6144 MiB of memory (`ENCLAVE_CPUS`, `ENCLAVE_MEMORY`). Bridge clients to vsock port 3000 through the parent instance, and register the image's PCR measurements through the Move enclave policy before using its signatures on-chain. Never enable the `dev` feature in a production image.
+
+### Sizing the enclave
+
+The service sizes `/v1/measure` to the enclave at boot, from the vCPUs it may run on (`std::thread::available_parallelism`) and `MemTotal` in `/proc/meminfo`, and logs the result:
+
+```
+[server] /v1/measure jobs: 4 (4 vCPUs, MemTotal <n> MiB)
+```
+
+The parent sets both with `nitro-cli run-enclave --cpu-count --memory`. Neither is part of the PCRs, so an enclave can be resized without a new image or a new registration. The rule, in `measure_concurrency`:
+
+```
+reserve = 128 MiB                      kernel, in-memory root file system, runtime, connections
+        + 2 * max_body_bytes + 48 MiB  the one /process_data upload: its body, a second copy
+                                       while its chunks are joined, and its decode
+jobs    = max(1, min(vCPUs, (MemTotal - reserve) / 48 MiB))
+```
+
+48 MiB is the worst case of one job (see `MEASURE_JOB_BYTES`); a typical job uses 2 to 10 MiB. If either resource cannot be read, it counts as room for one job. `MemTotal` is somewhat below `--memory`, which also pays for the kernel. With the default 256 MiB file limit the reserve is 688 MiB, so vCPUs decide whenever `MemTotal` is at least 688 MiB plus 48 MiB per vCPU:
+
+| vCPUs | `MemTotal` | `/v1/measure` jobs |
+|---|---|---|
+| 2 | 1900 MiB (`--memory 2048`) | 2 |
+| 4 | under 6144 MiB (`--memory 6144`, the `make run-eif` default) | 4 |
+| 8 | under 16384 MiB | 8 |
+| 16 | 1024 MiB | 7, bounded by memory |
+| any | 783 MiB or less | 1 |
+
+Give each job its own vCPU: every job runs a decoder and a hasher thread, and Tokio and `/process_data` share the rest. Two vCPUs and 2 GiB run two jobs with room to spare; more vCPUs add jobs as long as memory allows. Lowering `--max-body-bytes` shrinks the reserve.
 
 ## Test
 
@@ -132,8 +162,10 @@ The image is written to `out/nitro.eif`. The default enclave allocation is four 
 cargo test --locked --workspace
 ```
 
-Every measurement case also runs streamed, in chunks of 1, 7, 4096 and 1 MiB bytes and whole, and must reach the same verdict. Installing `ffmpeg` enables additional decoder cross-checks. The Move package's tests live with it in `misofm/framework`.
+Every measurement case also runs streamed, in chunks of 1, 7, 4096 and 1 MiB bytes and whole, and must reach the same verdict, error included. A differential fuzz (`crates/audio-verifier/tests/differential.rs`, fixed seed) mutates seven files 150 times each and requires the same result from the buffered and several streamed readings of each; set `FUZZ_ITERATIONS` for a longer run. Installing `ffmpeg` enables additional decoder cross-checks. The Move package's tests live with it in `misofm/framework`.
 
 ## License
 
 [Functional Source License 1.1, ALv2 Future License](LICENSE.md). Vendored libFLAC is [BSD-3-Clause licensed](crates/libflac/flac-1.5.0/COPYING.Xiph); its notice must accompany binary distributions.
+
+`crates/libflac/flac-1.5.0` is the libFLAC 1.5.0 release's stream decoder, vendored by `scripts/vendor-libflac.sh`, which checks the release archive's SHA-256 and then applies [`crates/libflac/patches`](crates/libflac/patches) in order. There is one patch: [`0001-rice-tail-unary-limit.patch`](crates/libflac/patches/0001-rice-tail-unary-limit.patch) enforces the Rice decoder's unary-length limit when a code runs into the end of the buffered input, where 1.5.0 skipped it and decoded overlong codes to PCM other decoders do not produce. It is not fixed upstream as of November 2026.
