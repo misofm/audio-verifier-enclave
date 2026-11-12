@@ -34,7 +34,13 @@ pub fn scratch_file(name: &str, bytes: &[u8]) -> PathBuf {
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("audio-verifier");
     std::fs::create_dir_all(&dir).expect("scratch dir");
     let path = dir.join(name);
-    std::fs::write(&path, bytes).expect("scratch file");
+    let partial = dir.join(format!(
+        "{name}.{}.{:?}.partial",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::write(&partial, bytes).expect("scratch file");
+    std::fs::rename(&partial, &path).expect("scratch file");
     path
 }
 
