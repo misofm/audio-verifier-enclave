@@ -1,5 +1,6 @@
 # Reproducible EIF builder for the audio-verifier enclave, adapted from
-# unconfirmedlabs/nautilus-rust 46a9d27 (Apache-2.0). It follows the StageX
+# unconfirmedlabs/nautilus-rust (Apache-2.0); its StageX pins are those of
+# nautilus-rust d74178b, the revision Cargo.toml pins. It follows the StageX
 # pattern: pinned source-bootstrapped build inputs, normalized initramfs
 # timestamps, and explicit PCR output.
 #

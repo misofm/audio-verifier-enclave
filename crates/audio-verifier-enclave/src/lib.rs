@@ -4,7 +4,9 @@ use std::time::Duration;
 
 use audio_verifier::{AudioPayload, FileStats, measure};
 use axum::{Router, body::Bytes};
-use nautilus::{ConfigError, Intent, NautilusContext, NautilusError, ServerConfig, SignedResponse};
+use nautilus::{
+    ConfigError, Intent, NautilusContext, NautilusError, ServerConfig, SignedResponse, Timestamp,
+};
 use serde::{Deserialize, Serialize};
 
 pub use stream::{StreamConfig, measure_routes};
@@ -155,14 +157,20 @@ pub fn response(ctx: &NautilusContext, audio: SignedResponse<AudioPayload>) -> P
     }
 }
 
-/// Signing attempts for two messages that must carry the same timestamp. Nautilus stamps each
-/// message with its own clock read, and two signatures rarely straddle a millisecond.
-const SIGNING_ATTEMPTS: usize = 4;
-
 /// Signs the audio facts under [`AUDIO_INTENT`] and the file binding under
-/// [`MASTER_FILE_INTENT`], both with one timestamp.
+/// [`MASTER_FILE_INTENT`], both with one reading of the enclave clock.
 pub fn sign_measurement(
     ctx: &NautilusContext,
+    audio: AudioPayload,
+    file: &FileStats,
+) -> Result<MeasureResponse, NautilusError> {
+    sign_measurement_stamped(ctx, ctx.now()?, audio, file)
+}
+
+/// As [`sign_measurement`], with a given reading of the clock: both messages carry `timestamp`.
+pub fn sign_measurement_stamped(
+    ctx: &NautilusContext,
+    timestamp: Timestamp,
     audio: AudioPayload,
     file: &FileStats,
 ) -> Result<MeasureResponse, NautilusError> {
@@ -171,25 +179,17 @@ pub fn sign_measurement(
         file_size: file.len,
         file_sha256: file.sha256.to_vec(),
     };
-    for _ in 0..SIGNING_ATTEMPTS {
-        let audio = ctx.sign_intent(AUDIO_INTENT, audio.clone())?;
-        let binding = ctx.sign_intent(MASTER_FILE_INTENT, binding.clone())?;
-        if audio.response.timestamp_ms != binding.response.timestamp_ms {
-            continue;
-        }
-        let file = FileJson {
-            file_size: file.len.to_string(),
-            file_sha256: hex::encode(file.sha256),
-        };
-        return Ok(MeasureResponse {
-            audio: SignedJson::new(&audio, AudioJson::from(&audio.response.data)),
-            master_file: SignedJson::new(&binding, file),
-            public_key: ctx.public_key_hex(),
-        });
-    }
-    Err(NautilusError::Clock(
-        "the clock advanced during every signing attempt".into(),
-    ))
+    let audio = ctx.sign_intent_stamped(AUDIO_INTENT, timestamp, audio)?;
+    let binding = ctx.sign_intent_stamped(MASTER_FILE_INTENT, timestamp, binding)?;
+    let file = FileJson {
+        file_size: file.len.to_string(),
+        file_sha256: hex::encode(file.sha256),
+    };
+    Ok(MeasureResponse {
+        audio: SignedJson::new(&audio, AudioJson::from(&audio.response.data)),
+        master_file: SignedJson::new(&binding, file),
+        public_key: ctx.public_key_hex(),
+    })
 }
 
 /// Measures `bytes` and signs the audio facts.

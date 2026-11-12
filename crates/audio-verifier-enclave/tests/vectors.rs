@@ -1,12 +1,13 @@
 use std::path::Path;
 
-use audio_verifier::AudioPayload;
+use audio_verifier::{AudioPayload, FileStats};
 use audio_verifier_enclave::{
-    AUDIO_INTENT, AudioJson, MASTER_FILE_INTENT, MasterFilePayload, ProcessDataResponse, response,
+    AUDIO_INTENT, AudioJson, MASTER_FILE_INTENT, MasterFilePayload, MeasureResponse,
+    ProcessDataResponse, response, sign_measurement_stamped,
 };
 use nautilus::{
-    EnclaveIdentity, Intent, NautilusContext, intent_message, testing::FakeAttestor,
-    verify_signed_response,
+    EnclaveIdentity, Intent, IntentMessage, NautilusContext, SignedResponse, Timestamp,
+    intent_message, testing::FakeAttestor, verify_signed_response,
 };
 use serde::Serialize;
 
@@ -110,11 +111,27 @@ fn audio_vector() -> (Vector<AudioJson>, NautilusContext) {
     (audio, ctx)
 }
 
+/// The `/v1/measure` signatures over the fixed payloads, through the route's own signing code.
+fn measurement(ctx: &NautilusContext) -> MeasureResponse {
+    let file = FileStats {
+        len: FILE_SIZE,
+        sha256: [0x22; 32],
+        peak_held: 0,
+    };
+    sign_measurement_stamped(ctx, Timestamp::from_ms(TIMESTAMP_MS), fixed_audio(), &file)
+        .expect("sign")
+}
+
 fn master_file_vector() -> (Vector<MasterFileFields>, NautilusContext) {
     let ctx = context();
-    let signed = ctx
-        .sign_intent_at(MASTER_FILE_INTENT, TIMESTAMP_MS, fixed_master_file())
-        .expect("sign");
+    let signed = SignedResponse {
+        response: IntentMessage {
+            intent: MASTER_FILE_INTENT,
+            timestamp_ms: TIMESTAMP_MS,
+            data: fixed_master_file(),
+        },
+        signature: measurement(&ctx).master_file.signature,
+    };
     verify_signed_response(&ctx.public_key(), MASTER_FILE_INTENT, &signed)
         .expect("file binding verifies");
     let payload = signed.response.data;
@@ -187,6 +204,32 @@ fn assert_signs<T>(vector: &Vector<T>, ctx: &NautilusContext, intent: Intent) {
             .is_err(),
         "a signature under the other intent does not verify"
     );
+}
+
+#[test]
+fn measurement_signs_both_vectors_with_one_timestamp() {
+    let ctx = context();
+    let measured = measurement(&ctx);
+    assert_eq!(measured.audio.timestamp_ms, TIMESTAMP_MS);
+    assert_eq!(measured.master_file.timestamp_ms, TIMESTAMP_MS);
+    let (audio, _) = audio_vector();
+    assert_eq!(measured.audio.signature, audio.signature);
+    assert_eq!(measured.audio.data, audio.fields);
+    let (master_file, _) = master_file_vector();
+    assert_eq!(measured.master_file.signature, master_file.signature);
+    assert_eq!(
+        measured.master_file.data.file_size,
+        master_file.fields.file_size
+    );
+    assert_eq!(
+        measured.master_file.data.file_sha256,
+        master_file.fields.file_sha256
+    );
+    // The stamped signature is the one Nautilus gives at that time.
+    let at = ctx
+        .sign_intent_at(MASTER_FILE_INTENT, TIMESTAMP_MS, fixed_master_file())
+        .expect("sign");
+    assert_eq!(measured.master_file.signature, at.signature);
 }
 
 #[test]

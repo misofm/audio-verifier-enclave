@@ -653,8 +653,8 @@ dependencies = [
 
 [[package]]
 name = "nautilus"
-version = "0.3.0"
-source = "git+https://github.com/unconfirmedlabs/nautilus-rust?rev=46a9d27777bc749f76eb5ae1360eb77d2361a94d#46a9d27777bc749f76eb5ae1360eb77d2361a94d"
+version = "0.3.1"
+source = "git+https://github.com/unconfirmedlabs/nautilus-rust?rev=d74178b0aab4a669394925449befa4ce6a15abdb#d74178b0aab4a669394925449befa4ce6a15abdb"
 dependencies = [
  "axum",
  "bcs",
@@ -679,8 +679,8 @@ dependencies = [
 
 [[package]]
 name = "nautilus-nsm"
-version = "0.3.0"
-source = "git+https://github.com/unconfirmedlabs/nautilus-rust?rev=46a9d27777bc749f76eb5ae1360eb77d2361a94d#46a9d27777bc749f76eb5ae1360eb77d2361a94d"
+version = "0.3.1"
+source = "git+https://github.com/unconfirmedlabs/nautilus-rust?rev=d74178b0aab4a669394925449befa4ce6a15abdb#d74178b0aab4a669394925449befa4ce6a15abdb"
 dependencies = [
  "ciborium",
  "libc",
