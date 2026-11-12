@@ -1,11 +1,10 @@
 //! `POST /v1/measure`: the FLAC file as a streamed body, measured as it arrives.
 //!
-//! Nautilus's `/process_data` buffers the whole body before its handler runs, so this route,
-//! merged into the same `Router`, reads the body itself. Chunks go through a bounded channel to
-//! `measure_reader` on the blocking pool, so a request holds the decoder's window and the
+//! The route reads the body itself instead of buffering it. Chunks go through a bounded channel
+//! to `measure_reader` on the blocking pool, so a request holds the decoder's window and the
 //! channel's chunks, whatever the file's size: about 1 MiB of the file for typical frames, and
 //! at most [`crate::MEASURE_JOB_BYTES`] in all. The route has its own concurrency permits and
-//! deadlines: Nautilus's apply only to its own routes.
+//! deadlines.
 
 use std::{io, sync::Arc, time::Duration};
 
@@ -25,7 +24,10 @@ use tokio::{
     time::timeout,
 };
 
-use crate::sign_measurement;
+use crate::{
+    routes::{refuse, refuse_with},
+    sign_measurement,
+};
 
 /// Body chunks queued for the decoder before the route stops reading.
 const CHANNEL_DEPTH: usize = 16;
@@ -49,7 +51,7 @@ struct StreamState {
     permits: Arc<Semaphore>,
 }
 
-/// The `/v1/measure` route, to merge into the Nautilus router.
+/// The `/v1/measure` route, which [`crate::app`] mounts.
 pub fn measure_routes(ctx: NautilusContext, config: StreamConfig) -> Router {
     let permits = Arc::new(Semaphore::new(
         config.max_concurrent.min(Semaphore::MAX_PERMITS),
@@ -61,16 +63,6 @@ pub fn measure_routes(ctx: NautilusContext, config: StreamConfig) -> Router {
             config,
             permits,
         }))
-}
-
-/// A JSON error in Nautilus's `{ error, message }` shape.
-fn refuse(status: StatusCode, error: &str, message: impl Into<String>) -> Response {
-    let body = serde_json::json!({ "error": error, "message": message.into() });
-    (status, Json(body)).into_response()
-}
-
-fn refuse_with(code: ErrorCode, message: impl Into<String>) -> Response {
-    refuse(code.status(), code.as_str(), message)
 }
 
 async fn measure(State(state): State<Arc<StreamState>>, request: Request) -> Response {

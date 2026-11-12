@@ -18,8 +18,9 @@ const MIB: u64 = 1 << 20;
 /// - the metadata (64 KiB), two thread stacks and the response.
 pub const MEASURE_JOB_BYTES: u64 = 48 * MIB;
 
-/// Memory kept for everything but the jobs and `/process_data`: the kernel's own allocations,
-/// the root file system the image unpacks into memory, the runtime, and up to 256 connections.
+/// Memory kept for everything but the jobs: the kernel's own allocations, the root file system
+/// the image unpacks into memory, the runtime, and up to 256 connections, each with at most a
+/// 4 KiB `/attestation` body.
 pub const PROCESS_RESERVE_BYTES: u64 = 128 * MIB;
 
 /// The enclave's vCPUs and memory, as its kernel reports them; either may be unknown.
@@ -59,23 +60,13 @@ pub fn mem_total(meminfo: &str) -> Option<u64> {
     kib.checked_mul(1024)
 }
 
-/// Memory the one `/process_data` slot can take: its body, a second copy while the body's chunks
-/// are joined, and the decode of the buffered file, bounded by a job's.
-pub fn process_data_bytes(max_body_bytes: u64) -> u64 {
-    max_body_bytes
-        .saturating_mul(2)
-        .saturating_add(MEASURE_JOB_BYTES)
-}
-
-/// Concurrent `/v1/measure` jobs for an enclave with `resources` and a file limit of
-/// `max_body_bytes`: one per vCPU, and no more than fit in `MemTotal` after
-/// [`PROCESS_RESERVE_BYTES`] and [`process_data_bytes`] at [`MEASURE_JOB_BYTES`] each, but at
-/// least one. An unknown vCPU count or memory size counts as room for one.
-pub fn measure_concurrency(resources: Resources, max_body_bytes: u64) -> usize {
+/// Concurrent `/v1/measure` jobs for an enclave with `resources`: one per vCPU, and no more than
+/// fit in `MemTotal` after [`PROCESS_RESERVE_BYTES`] at [`MEASURE_JOB_BYTES`] each, but at least
+/// one. An unknown vCPU count or memory size counts as room for one.
+pub fn measure_concurrency(resources: Resources) -> usize {
     let cpus = resources.cpus.unwrap_or(1);
     let by_memory = resources.memory_bytes.map_or(1, |memory| {
-        let reserve = PROCESS_RESERVE_BYTES.saturating_add(process_data_bytes(max_body_bytes));
-        memory.saturating_sub(reserve) / MEASURE_JOB_BYTES
+        memory.saturating_sub(PROCESS_RESERVE_BYTES) / MEASURE_JOB_BYTES
     });
     cpus.min(usize::try_from(by_memory).unwrap_or(usize::MAX))
         .max(1)
@@ -84,8 +75,6 @@ pub fn measure_concurrency(resources: Resources, max_body_bytes: u64) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const LIMIT: u64 = 256 * MIB;
 
     fn enclave(cpus: usize, memory_mib: u64) -> Resources {
         Resources {
@@ -96,31 +85,26 @@ mod tests {
 
     #[test]
     fn typical_enclaves_run_one_job_per_vcpu() {
-        assert_eq!(measure_concurrency(enclave(2, 2048), LIMIT), 2);
-        assert_eq!(measure_concurrency(enclave(4, 6144), LIMIT), 4);
-        assert_eq!(measure_concurrency(enclave(8, 16_384), LIMIT), 8);
+        assert_eq!(measure_concurrency(enclave(2, 2048)), 2);
+        assert_eq!(measure_concurrency(enclave(4, 6144)), 4);
+        assert_eq!(measure_concurrency(enclave(8, 16_384)), 8);
         // MemTotal is somewhat below `--memory`; 2 GiB still runs two jobs.
-        assert_eq!(measure_concurrency(enclave(2, 1900), LIMIT), 2);
+        assert_eq!(measure_concurrency(enclave(2, 1900)), 2);
     }
 
     #[test]
     fn memory_bounds_the_jobs_when_vcpus_are_plentiful() {
-        // 128 + 2 * 256 + 48 = 688 MiB reserved; 1024 - 688 = 336 MiB is room for 7 jobs.
-        assert_eq!(measure_concurrency(enclave(16, 1024), LIMIT), 7);
-        assert_eq!(
-            measure_concurrency(enclave(64, 688 + 48 * 10 - 1), LIMIT),
-            9
-        );
-        // A lower file limit shrinks the /process_data reserve: 128 + 32 + 48 = 208 MiB.
-        assert_eq!(measure_concurrency(enclave(32, 1024), 16 * MIB), 17);
+        // 128 MiB reserved; 1024 - 128 = 896 MiB is room for 18 jobs.
+        assert_eq!(measure_concurrency(enclave(32, 1024)), 18);
+        assert_eq!(measure_concurrency(enclave(64, 128 + 48 * 10 - 1)), 9);
+        assert_eq!(measure_concurrency(enclave(64, 128 + 48 * 10)), 10);
     }
 
     #[test]
     fn low_memory_still_runs_one_job() {
-        assert_eq!(measure_concurrency(enclave(8, 700), LIMIT), 1);
-        assert_eq!(measure_concurrency(enclave(2, 512), LIMIT), 1);
-        assert_eq!(measure_concurrency(enclave(4, 0), LIMIT), 1);
-        assert_eq!(measure_concurrency(enclave(4, 4096), u64::MAX), 1);
+        assert_eq!(measure_concurrency(enclave(8, 128 + 48 * 2 - 1)), 1);
+        assert_eq!(measure_concurrency(enclave(2, 100)), 1);
+        assert_eq!(measure_concurrency(enclave(4, 0)), 1);
     }
 
     #[test]
@@ -129,17 +113,17 @@ mod tests {
             cpus: None,
             memory_bytes: None,
         };
-        assert_eq!(measure_concurrency(unknown, LIMIT), 1);
+        assert_eq!(measure_concurrency(unknown), 1);
         let no_memory = Resources {
             cpus: Some(32),
             memory_bytes: None,
         };
-        assert_eq!(measure_concurrency(no_memory, LIMIT), 1);
+        assert_eq!(measure_concurrency(no_memory), 1);
         let no_cpus = Resources {
             cpus: None,
             memory_bytes: Some(64 * 1024 * MIB),
         };
-        assert_eq!(measure_concurrency(no_cpus, LIMIT), 1);
+        assert_eq!(measure_concurrency(no_cpus), 1);
     }
 
     #[test]
@@ -162,6 +146,6 @@ mod tests {
         if cfg!(target_os = "linux") {
             assert!(resources.memory_bytes.is_some_and(|bytes| bytes > 0));
         }
-        assert!(measure_concurrency(resources, LIMIT) >= 1);
+        assert!(measure_concurrency(resources) >= 1);
     }
 }

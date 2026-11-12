@@ -3,7 +3,7 @@ use std::path::Path;
 use audio_verifier::{AudioPayload, FileStats};
 use audio_verifier_enclave::{
     AUDIO_INTENT, AudioJson, MASTER_FILE_INTENT, MasterFilePayload, MeasureResponse,
-    ProcessDataResponse, response, sign_measurement_stamped,
+    sign_measurement_stamped,
 };
 use nautilus::{
     EnclaveIdentity, Intent, IntentMessage, NautilusContext, SignedResponse, Timestamp,
@@ -63,14 +63,6 @@ fn context() -> NautilusContext {
     )
 }
 
-fn signed(ctx: &NautilusContext) -> ProcessDataResponse {
-    let audio = ctx
-        .sign_intent_at(AUDIO_INTENT, TIMESTAMP_MS, fixed_audio())
-        .expect("sign");
-    verify_signed_response(&ctx.public_key(), AUDIO_INTENT, &audio).expect("audio verifies");
-    response(ctx, audio)
-}
-
 fn vector<P: Serialize + Clone, T>(
     ctx: &NautilusContext,
     intent: Intent,
@@ -99,14 +91,17 @@ fn vector<P: Serialize + Clone, T>(
 
 fn audio_vector() -> (Vector<AudioJson>, NautilusContext) {
     let ctx = context();
-    let body = signed(&ctx);
+    let signed = ctx
+        .sign_intent_at(AUDIO_INTENT, TIMESTAMP_MS, fixed_audio())
+        .expect("sign");
+    verify_signed_response(&ctx.public_key(), AUDIO_INTENT, &signed).expect("audio verifies");
     let audio = vector(
         &ctx,
         AUDIO_INTENT,
         OTHER_INTENT,
         fixed_audio(),
-        body.audio.signature,
-        body.audio.data,
+        signed.signature,
+        AudioJson::from(&signed.response.data),
     );
     (audio, ctx)
 }

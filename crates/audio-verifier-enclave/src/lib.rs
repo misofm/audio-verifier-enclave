@@ -1,18 +1,16 @@
+mod routes;
 mod sizing;
 mod stream;
 
 use std::time::Duration;
 
-use audio_verifier::{AudioPayload, FileStats, measure};
-use axum::{Router, body::Bytes};
-use nautilus::{
-    ConfigError, Intent, NautilusContext, NautilusError, ServerConfig, SignedResponse, Timestamp,
-};
+use audio_verifier::{AudioPayload, FileStats};
+use nautilus::{Intent, NautilusContext, NautilusError, ServerConfig, SignedResponse, Timestamp};
 use serde::{Deserialize, Serialize};
 
+pub use routes::app;
 pub use sizing::{
     MEASURE_JOB_BYTES, PROCESS_RESERVE_BYTES, Resources, measure_concurrency, mem_total,
-    process_data_bytes,
 };
 pub use stream::{StreamConfig, measure_routes};
 
@@ -24,22 +22,21 @@ pub const AUDIO_INTENT: Intent = Intent(0);
 /// retired `AudioEncodingPayload` and is not reused.
 pub const MASTER_FILE_INTENT: Intent = Intent(2);
 
-/// Default limit on a file's size, for `/process_data` and `/v1/measure` alike.
+/// Default limit on the size of a file sent to `/v1/measure`.
 pub const DEFAULT_MAX_BODY_BYTES: usize = 256 * 1024 * 1024;
 
 /// Maximum decoded PCM work per request, including all channels (4 GiB).
 pub use audio_verifier::MAX_DECODED_BYTES;
 
-/// Deadline for one `/process_data` upload and measurement.
-pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+/// Largest accepted `/attestation` body.
+pub const ATTESTATION_BODY_BYTES: usize = 4 * 1024;
 
-/// Deadline for a `/process_data` upload alone: 256 MiB needs about 3 MB/s, leaving at least
-/// 30 s to measure.
-pub const BODY_READ_TIMEOUT: Duration = Duration::from_secs(90);
+/// Deadline for one `/attestation` request, body and attestation.
+pub const ATTESTATION_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Open connections, matching the host bridge's 256. Idle ones cost little, because the single
-/// `max_concurrent` permit is taken before a body is read; a low cap let a few idle connections
-/// lock out every request, `/health_check` included, until `HEADER_READ_TIMEOUT` reaped them.
+/// Open connections, matching the host bridge's 256. Idle ones cost little; a low cap let a few
+/// idle connections lock out every request, `/health_check` included, until
+/// `HEADER_READ_TIMEOUT` reaped them.
 pub const MAX_CONNECTIONS: usize = 256;
 
 /// Deadline for request headers, including a kept-alive connection's next request.
@@ -109,15 +106,6 @@ impl<T> SignedJson<T> {
     }
 }
 
-/// `/process_data` response body: the signed audio facts.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProcessDataResponse {
-    /// The audio facts, for `verify_audio`.
-    pub audio: SignedJson<AudioJson>,
-    /// Enclave Ed25519 public key as hex.
-    pub public_key: String,
-}
-
 /// BCS layout of the file binding signed under [`MASTER_FILE_INTENT`]: the audio facts, as
 /// signed under [`AUDIO_INTENT`], and the size and SHA-256 of the exact bytes measured.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -148,14 +136,6 @@ pub struct MeasureResponse {
     pub master_file: SignedJson<FileJson>,
     /// Enclave Ed25519 public key as hex.
     pub public_key: String,
-}
-
-/// Renders the signed audio facts as the `/process_data` response.
-pub fn response(ctx: &NautilusContext, audio: SignedResponse<AudioPayload>) -> ProcessDataResponse {
-    ProcessDataResponse {
-        audio: SignedJson::new(&audio, AudioJson::from(&audio.response.data)),
-        public_key: ctx.public_key_hex(),
-    }
 }
 
 /// Signs the audio facts under [`AUDIO_INTENT`] and the file binding under
@@ -193,29 +173,20 @@ pub fn sign_measurement_stamped(
     })
 }
 
-/// Measures `bytes` and signs the audio facts.
-pub fn process(bytes: &[u8], ctx: &NautilusContext) -> Result<ProcessDataResponse, NautilusError> {
-    let audio = measure(bytes).map_err(|error| NautilusError::application(error.to_string()))?;
-    let audio = ctx.sign_intent(AUDIO_INTENT, audio)?;
-    Ok(response(ctx, audio))
-}
-
-/// Server limits for one request at a time; pass the same value to the router and the listener.
-pub fn server_config(max_body_bytes: usize) -> ServerConfig {
+/// Connection limits for [`nautilus::serve`], which reads only `max_connections`,
+/// `header_read_timeout` and `idle_timeout`; the other fields configure Nautilus's router, which
+/// this service does not use.
+pub fn server_config() -> ServerConfig {
     ServerConfig {
-        max_body_bytes,
-        max_concurrent: 1,
-        request_timeout: REQUEST_TIMEOUT,
-        body_read_timeout: BODY_READ_TIMEOUT,
         max_connections: MAX_CONNECTIONS,
         header_read_timeout: HEADER_READ_TIMEOUT,
         idle_timeout: IDLE_TIMEOUT,
-        allow_unnonced_attestation: false,
+        ..ServerConfig::default()
     }
 }
 
-/// Limits of `/v1/measure` for files of up to `max_file_bytes` and `max_concurrent` jobs at once,
-/// besides the one `/process_data` upload; [`measure_concurrency`] sizes them to the enclave.
+/// Limits of `/v1/measure` for files of up to `max_file_bytes` and `max_concurrent` jobs at once;
+/// [`measure_concurrency`] sizes them to the enclave.
 pub fn stream_config(max_file_bytes: usize, max_concurrent: usize) -> StreamConfig {
     StreamConfig {
         max_file_bytes: max_file_bytes as u64,
@@ -223,22 +194,6 @@ pub fn stream_config(max_file_bytes: usize, max_concurrent: usize) -> StreamConf
         chunk_timeout: MEASURE_CHUNK_TIMEOUT,
         request_timeout: MEASURE_REQUEST_TIMEOUT,
     }
-}
-
-/// Builds the enclave router around an injected context: Nautilus's `/health_check`,
-/// `/attestation` and buffered `/process_data`, and the streaming `/v1/measure`, whose file limit
-/// is `config.max_body_bytes` and which runs up to `measure_concurrent` jobs at once.
-pub fn app(
-    ctx: NautilusContext,
-    config: ServerConfig,
-    measure_concurrent: usize,
-) -> Result<Router, ConfigError> {
-    let stream = stream_config(config.max_body_bytes, measure_concurrent);
-    let measure = measure_routes(ctx.clone(), stream);
-    let router = nautilus::router(ctx, config, |bytes: Bytes, ctx: &NautilusContext| {
-        process(&bytes, ctx)
-    })?;
-    Ok(router.merge(measure))
 }
 
 /// Resolves the body limit from `--max-body-bytes`, then the environment, then the default.

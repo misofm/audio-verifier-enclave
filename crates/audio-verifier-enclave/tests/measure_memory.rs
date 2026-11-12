@@ -4,7 +4,7 @@
 
 use std::path::Path;
 
-use audio_verifier_enclave::{DEFAULT_MAX_BODY_BYTES, MEASURE_JOB_BYTES, app, server_config};
+use audio_verifier_enclave::{DEFAULT_MAX_BODY_BYTES, MEASURE_JOB_BYTES, app};
 use axum::{
     Router,
     body::{Body, Bytes},
@@ -93,7 +93,7 @@ async fn unterminated_frames_cost_a_window_each() {
         EnclaveIdentity::from_seed([9u8; 32]),
         FakeAttestor::default(),
     );
-    let router = app(ctx, server_config(DEFAULT_MAX_BODY_BYTES), 2).expect("config");
+    let router = app(ctx, DEFAULT_MAX_BODY_BYTES, 2);
     let before = peak_rss_kib();
     let total = DEFAULT_MAX_BODY_BYTES;
     let (first, second) = tokio::join!(

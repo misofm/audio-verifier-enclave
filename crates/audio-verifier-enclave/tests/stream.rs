@@ -3,8 +3,8 @@ use std::{path::Path, time::Duration};
 use audio_verifier::{AudioPayload, measure};
 use audio_verifier_enclave::{
     AUDIO_INTENT, DEFAULT_MAX_BODY_BYTES, MASTER_FILE_INTENT, MEASURE_CHUNK_TIMEOUT,
-    MEASURE_REQUEST_TIMEOUT, MasterFilePayload, MeasureResponse, ProcessDataResponse, StreamConfig,
-    app, measure_routes, server_config, stream_config,
+    MEASURE_REQUEST_TIMEOUT, MasterFilePayload, MeasureResponse, StreamConfig, app, measure_routes,
+    stream_config,
 };
 use axum::{
     Router,
@@ -13,7 +13,7 @@ use axum::{
 };
 use http_body_util::BodyExt as _;
 use nautilus::{
-    EnclaveIdentity, IntentMessage, NautilusContext, ServerConfig, SignedResponse, intent_message,
+    EnclaveIdentity, IntentMessage, NautilusContext, SignedResponse, intent_message,
     testing::FakeAttestor, verify_signed_response,
 };
 use sha2::{Digest as _, Sha256};
@@ -89,7 +89,7 @@ fn open_body(length: usize) -> (Request<Body>, mpsc::Sender<Chunk>) {
 const CONCURRENT: usize = 2;
 
 fn router(limit: usize) -> Router {
-    app(context(), server_config(limit), CONCURRENT).expect("config")
+    app(context(), limit, CONCURRENT)
 }
 
 async fn json(response: Response<Body>) -> (StatusCode, serde_json::Value) {
@@ -145,12 +145,7 @@ fn verify(ctx: &NautilusContext, body: &MeasureResponse, audio: &AudioPayload, f
 #[tokio::test]
 async fn streamed_file_is_signed_twice_with_one_timestamp() {
     let ctx = context();
-    let router = app(
-        ctx.clone(),
-        server_config(DEFAULT_MAX_BODY_BYTES),
-        CONCURRENT,
-    )
-    .expect("config");
+    let router = app(ctx.clone(), DEFAULT_MAX_BODY_BYTES, CONCURRENT);
     let bytes = fixture();
     let measured = measure(&bytes).expect("fixture");
     for chunk in [1, 7, 4096, 1 << 20, usize::MAX] {
@@ -195,17 +190,13 @@ async fn streamed_file_is_signed_twice_with_one_timestamp() {
 }
 
 #[tokio::test]
-async fn tags_are_skipped_on_both_routes() {
+async fn tags_are_skipped_streamed_and_buffered() {
     let ctx = context();
-    let router = app(
-        ctx.clone(),
-        server_config(DEFAULT_MAX_BODY_BYTES),
-        CONCURRENT,
-    )
-    .expect("config");
+    let router = app(ctx.clone(), DEFAULT_MAX_BODY_BYTES, CONCURRENT);
     let canonical = fixture();
     let tagged = tagged(&canonical);
     let measured = measure(&canonical).expect("fixture");
+    assert_eq!(measure(&tagged).expect("tagged"), measured);
 
     let (status, value) = send(&router, streamed(&tagged, 4096, Some(tagged.len()))).await;
     assert_eq!(status, StatusCode::OK, "{value}");
@@ -219,23 +210,10 @@ async fn tags_are_skipped_on_both_routes() {
         hex::encode(sha256(&tagged))
     );
     verify(&ctx, &body, &measured, &tagged);
-
-    let process = Request::builder()
-        .method("POST")
-        .uri("/process_data")
-        .body(Body::from(tagged))
-        .expect("request");
-    let (status, value) = send(&router, process).await;
-    assert_eq!(status, StatusCode::OK, "{value}");
-    let body: ProcessDataResponse = serde_json::from_value(value).expect("shape");
-    assert_eq!(
-        body.audio.data.pcm_digest,
-        hex::encode(&measured.pcm_digest)
-    );
 }
 
 #[tokio::test]
-async fn other_metadata_is_rejected_on_both_routes() {
+async fn other_metadata_is_rejected_streamed_and_buffered() {
     let canonical = fixture();
     let mut picture = canonical[..42].to_vec();
     picture[4] &= 0x7f;
@@ -249,15 +227,8 @@ async fn other_metadata_is_rejected_on_both_routes() {
     let message = value["message"].as_str().expect("message");
     assert!(message.contains("metadata block type 6"), "{message}");
     assert!(!value.to_string().contains("signature"));
-
-    let process = Request::builder()
-        .method("POST")
-        .uri("/process_data")
-        .body(Body::from(picture))
-        .expect("request");
-    let (status, value) = send(&router, process).await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-    assert_eq!(value["message"], message);
+    let error = measure(&picture).expect_err("refused when buffered");
+    assert_eq!(error.to_string(), message);
 }
 
 #[tokio::test]
@@ -343,13 +314,11 @@ async fn concurrent_measurements_are_bounded() {
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(value["error"], "overloaded");
 
-    // `/process_data` has its own permit.
-    let process = Request::builder()
-        .method("POST")
-        .uri("/process_data")
-        .body(Body::from(bytes.clone()))
+    let health = Request::builder()
+        .uri("/health_check")
+        .body(Body::empty())
         .expect("request");
-    assert_eq!(send(&router, process).await.0, StatusCode::OK);
+    assert_eq!(send(&router, health).await.0, StatusCode::OK);
 
     let (response, sender) = pending.pop().expect("pending");
     sender
@@ -417,24 +386,6 @@ async fn request_deadline_covers_the_whole_measurement() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     assert_eq!(status, StatusCode::REQUEST_TIMEOUT);
-}
-
-#[tokio::test]
-async fn nautilus_deadlines_do_not_apply_to_the_stream() {
-    let config = ServerConfig {
-        request_timeout: Duration::from_millis(50),
-        body_read_timeout: Duration::from_millis(50),
-        ..server_config(DEFAULT_MAX_BODY_BYTES)
-    };
-    let router = app(context(), config, CONCURRENT).expect("config");
-    let bytes = fixture();
-    let (request, sender) = open_body(bytes.len());
-    let response = tokio::spawn(router.oneshot(request));
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    sender.send(Ok(Bytes::from(bytes))).await.expect("send");
-    drop(sender);
-    let (status, value) = json(response.await.expect("task").expect("response")).await;
-    assert_eq!(status, StatusCode::OK, "{value}");
 }
 
 #[test]

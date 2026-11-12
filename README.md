@@ -12,7 +12,7 @@ The service accepts FLAC files with:
 - After it, only PADDING, SEEKTABLE and VORBIS_COMMENT blocks, at most 64 KiB in total including their 4-byte headers. Any other block type (APPLICATION, CUESHEET, PICTURE or a reserved type), more metadata, or a SEEKTABLE that is not whole 18-byte seek points is rejected.
 - 8-, 16-, or 24-bit samples.
 - Sample rates of 44.1, 48, 88.2, 96, 176.4, 192, 352.8, or 384 kHz.
-- Frames of at most 16,777,215 bytes (2^24 - 1, the most STREAMINFO's `max_frame_size` can declare). No encoder writes frames near that size; larger ones are rejected on both routes.
+- Frames of at most 16,777,215 bytes (2^24 - 1, the most STREAMINFO's `max_frame_size` can declare). No encoder writes frames near that size; larger ones are rejected.
 - Metadata and frame contents that agree with the decoded audio, and no bytes after the last frame.
 
 Accepted metadata blocks are ignored: the audio facts describe the decoded PCM only, so a file measures exactly as its copy with tags and padding removed. The file binding (intent 2) does cover them, because it hashes the file's bytes. The blocks are not otherwise checked against the specification: a repeated SEEKTABLE or VORBIS_COMMENT is accepted, and so is PADDING that is not zero, which can carry up to 64 KiB of arbitrary bytes. None of it reaches the decoded audio.
@@ -26,11 +26,10 @@ The service serves HTTP: on vsock port 3000 in an enclave, and on `127.0.0.1:300
 | Route | Body | Response |
 |---|---|---|
 | `POST /v1/measure` | the FLAC file, streamed, with `Content-Length` | `audio` (intent 0), `master_file` (intent 2), `public_key` |
-| `POST /process_data` | the FLAC file, buffered in full | `audio` (intent 0), `public_key` |
 | `POST /attestation` | `{ "nonce": hex }` | `{ "attestation": hex }`, the NSM document binding `public_key` |
 | `GET /health_check` | | `{ "pk", "address" }` |
 
-`/health_check`, `/attestation` and `/process_data` come from Nautilus. `/v1/measure` decodes the file as it arrives, holding about 1 MiB of it for typical frames and never more than about 17 MiB, whatever its size, and stops reading as soon as the file is rejected. Both routes give the decoder the same reads, so a file gets the same verdict and error from either, however its body is chunked. A response from it looks like this:
+`/health_check` and `/attestation` answer as Nautilus's routes of the same names do; the service builds its own router rather than Nautilus's, which always mounts a buffered `/process_data`. `/v1/measure` decodes the file as it arrives, holding about 1 MiB of it for typical frames and never more than about 17 MiB, whatever its size, and stops reading as soon as the file is rejected. A file gets the same verdict and error however its body is chunked, and the same as the library's buffered `audio_verifier::measure` gives. A response looks like this:
 
 ```json
 {
@@ -48,20 +47,24 @@ The service serves HTTP: on vsock port 3000 in an enclave, and on `127.0.0.1:300
 }
 ```
 
-`samples_per_channel` and `file_size` are decimal strings. Both signatures carry the same `timestamp_ms`, the enclave's clock when it signed. `/process_data` returns the same `audio` and `public_key`, without `master_file`.
+`samples_per_channel` and `file_size` are decimal strings. Both signatures carry the same `timestamp_ms`, the enclave's clock when it signed.
 
-Limits and errors:
+Limits and errors of `/v1/measure`:
 
-| | `/v1/measure` | `/process_data` |
-|---|---|---|
-| File size | `Content-Length` required (411 `length_required`); over the limit, 413 `body_too_large` | over the limit, 413 `body_too_large` |
-| Concurrency | one measurement per vCPU, fewer if memory is short (see [Sizing the enclave](#sizing-the-enclave)), independent of `/process_data`; more get 429 `overloaded` | 1 upload, shared with `/attestation`; more get 429 `overloaded` |
-| Body | nothing received for 30 s: 408 `body_read_timeout`; a read error, or other than `Content-Length` bytes: 400 `body_read_failed`. A body that trickles in just faster than that keeps its permit until the request deadline | not received within 90 s: 408 `body_read_timeout` |
-| Request | 600 s for the body and the measurement: 408 `request_timeout` | 120 s: 408 `request_timeout` |
-| Memory per request | about 1 MiB of the file for typical frames, and 2 MiB in all, or about 10 MiB when the client sends faster than the decoder and the 16 queued body chunks fill; at most 48 MiB: a 17 MiB window, PCM and libFLAC buffers, and the queue | the whole file, up to twice that while its chunks are joined, and the decode |
-| Rejected file | 422 `application_error`, the reason in `message` | 422 `application_error`, the reason in `message` |
+| | |
+|---|---|
+| File size | `Content-Length` required (411 `length_required`); over the limit, 413 `body_too_large` |
+| Concurrency | one measurement per vCPU, fewer if memory is short (see [Sizing the enclave](#sizing-the-enclave)); more get 429 `overloaded` |
+| Body | nothing received for 30 s: 408 `body_read_timeout`; a read error, or other than `Content-Length` bytes: 400 `body_read_failed`. A body that trickles in just faster than that keeps its permit until the request deadline |
+| Request | 600 s for the body and the measurement: 408 `request_timeout` |
+| Memory per request | about 1 MiB of the file for typical frames, and 2 MiB in all, or about 10 MiB when the client sends faster than the decoder and the 16 queued body chunks fill; at most 48 MiB: a 17 MiB window, PCM and libFLAC buffers, and the queue |
+| Rejected file | 422 `application_error`, the reason in `message` |
 
-Set the file size limit, for both routes, with `--max-body-bytes` or `AUDIO_VERIFIER_MAX_BODY_BYTES`; it defaults to 256 MiB. The service also closes connections beyond 256, connections whose request headers take more than 10 s, and idle connections after 30 s.
+Set the file size limit with `--max-body-bytes` or `AUDIO_VERIFIER_MAX_BODY_BYTES`; it defaults to 256 MiB.
+
+`/attestation` requires a non-empty hex `nonce` of at most 512 bytes and accepts no other field (400 `invalid_request`). Its body may be at most 4 KiB (413 `body_too_large`, refused from `Content-Length` before it is read), and the request has 30 s (408 `request_timeout`). It attests one request at a time, after the body has arrived; others get 429 `overloaded`, and a failing attestation provider 503 `attestation_unavailable`.
+
+Unknown routes get 404 `not_found`, other methods 405 `method_not_allowed`, and a handler panic 500 `internal_error`. The service also closes connections beyond 256, connections whose request headers take more than 10 s, and idle connections after 30 s.
 
 ## What is signed
 
@@ -75,7 +78,7 @@ intent 0, verified on chain by audio_verifier::verify_audio:
   }
   message: 1 + 8 + 47 = 56 bytes
 
-intent 2, verified off chain, from /v1/measure only:
+intent 2, verified off chain, from /v1/measure:
   MasterFilePayload {
     audio: AudioPayload,       // the same facts as intent 0, nested
     file_size: u64,            // bytes of the file as received
@@ -138,23 +141,21 @@ The service sizes `/v1/measure` to the enclave at boot, from the vCPUs it may ru
 The parent sets both with `nitro-cli run-enclave --cpu-count --memory`. Neither is part of the PCRs, so an enclave can be resized without a new image or a new registration. The rule, in `measure_concurrency`:
 
 ```
-reserve = 128 MiB                      kernel, in-memory root file system, runtime, connections
-        + 2 * max_body_bytes + 48 MiB  the one /process_data upload: its body, a second copy
-                                       while its chunks are joined, and its decode
+reserve = 128 MiB   kernel, in-memory root file system, runtime, connections
 jobs    = max(1, min(vCPUs, (MemTotal - reserve) / 48 MiB))
 ```
 
-48 MiB is the worst case of one job (see `MEASURE_JOB_BYTES`); a typical job uses 2 to 10 MiB. If either resource cannot be read, it counts as room for one job. `MemTotal` is somewhat below `--memory`, which also pays for the kernel. With the default 256 MiB file limit the reserve is 688 MiB, so vCPUs decide whenever `MemTotal` is at least 688 MiB plus 48 MiB per vCPU:
+48 MiB is the worst case of one job (see `MEASURE_JOB_BYTES`); a typical job uses 2 to 10 MiB. A job's memory does not depend on the file size limit, and no route buffers a file. If either resource cannot be read, it counts as room for one job. `MemTotal` is somewhat below `--memory`, which also pays for the kernel. vCPUs decide whenever `MemTotal` is at least 128 MiB plus 48 MiB per vCPU:
 
 | vCPUs | `MemTotal` | `/v1/measure` jobs |
 |---|---|---|
 | 2 | 1900 MiB (`--memory 2048`) | 2 |
 | 4 | under 6144 MiB (`--memory 6144`, the `make run-eif` default) | 4 |
 | 8 | under 16384 MiB | 8 |
-| 16 | 1024 MiB | 7, bounded by memory |
-| any | 783 MiB or less | 1 |
+| 32 | 1024 MiB | 18, bounded by memory |
+| any | under 224 MiB | 1 |
 
-Give each job its own vCPU: every job runs a decoder and a hasher thread, and Tokio and `/process_data` share the rest. Two vCPUs and 2 GiB run two jobs with room to spare; more vCPUs add jobs as long as memory allows. Lowering `--max-body-bytes` shrinks the reserve.
+Give each job its own vCPU: every job runs a decoder and a hasher thread, and Tokio shares the rest. Two vCPUs and 2 GiB run two jobs with room to spare; more vCPUs add jobs as long as memory allows.
 
 ## Test
 

@@ -1,19 +1,19 @@
-use std::path::Path;
+use std::sync::{Mutex, mpsc};
 
-use audio_verifier::measure;
 use audio_verifier_enclave::{
-    AUDIO_INTENT, DEFAULT_MAX_BODY_BYTES, ProcessDataResponse, app, max_body_bytes, server_config,
+    ATTESTATION_BODY_BYTES, DEFAULT_MAX_BODY_BYTES, app, max_body_bytes, server_config,
 };
 use axum::{
     Router,
     body::{Body, Bytes},
-    http::{Request, Response, StatusCode},
+    http::{Request, Response, StatusCode, header},
 };
 use http_body_util::BodyExt as _;
 use nautilus::{
-    ConfigError, EnclaveIdentity, IntentMessage, NautilusContext, SignedResponse, intent_message,
-    testing::FakeAttestor, verify_signed_response,
+    AttestationError, AttestationRequest, Attestor, EnclaveIdentity, NautilusContext,
+    testing::FakeAttestor,
 };
+use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use tower::ServiceExt as _;
 
 fn context() -> NautilusContext {
@@ -23,163 +23,183 @@ fn context() -> NautilusContext {
     )
 }
 
-fn fixture() -> Vec<u8> {
-    std::fs::read(
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../audio-verifier/tests/fixtures/s16_stereo_44100.flac"),
-    )
-    .expect("fixture")
+fn router() -> Router {
+    app(context(), DEFAULT_MAX_BODY_BYTES, 2)
 }
 
-fn post(body: Body) -> Request<Body> {
+fn request(method: &str, uri: &str, body: impl Into<Body>) -> Request<Body> {
     Request::builder()
-        .method("POST")
-        .uri("/process_data")
-        .body(body)
+        .method(method)
+        .uri(uri)
+        .body(body.into())
         .expect("request")
 }
 
-async fn json(response: Response<Body>) -> serde_json::Value {
+async fn json(response: Response<Body>) -> (StatusCode, serde_json::Value) {
+    let status = response.status();
     let bytes = response
         .into_body()
         .collect()
         .await
         .expect("body")
         .to_bytes();
-    serde_json::from_slice(&bytes).expect("JSON")
+    (status, serde_json::from_slice(&bytes).expect("JSON"))
 }
 
-#[tokio::test]
-async fn process_data_signs_the_audio() {
-    let ctx = context();
-    let bytes = fixture();
-    let response = app(ctx.clone(), server_config(DEFAULT_MAX_BODY_BYTES), 2)
-        .expect("config")
-        .oneshot(post(Body::from(bytes.clone())))
-        .await
-        .expect("response");
-    assert_eq!(response.status(), StatusCode::OK);
-    let value = json(response).await;
-    let body: ProcessDataResponse = serde_json::from_value(value.clone()).expect("shape");
-
-    let measured = measure(&bytes).expect("fixture");
-    assert_eq!(value["audio"]["intent"], AUDIO_INTENT.0);
-    assert_eq!(value["audio"]["channels"], 2);
-    assert_eq!(value["audio"]["bit_depth"], 16);
-    assert_eq!(value["audio"]["sample_rate_hz"], 44_100);
-    assert_eq!(value["audio"]["samples_per_channel"], "11025");
-    assert!(value["audio"].get("format").is_none());
-    assert_eq!(
-        value
-            .as_object()
-            .expect("object")
-            .keys()
-            .collect::<Vec<_>>(),
-        ["audio", "public_key"]
-    );
-    assert_eq!(
-        body.audio.data.pcm_digest,
-        hex::encode(&measured.pcm_digest)
-    );
-    assert_eq!(body.public_key, ctx.public_key_hex());
-    assert!(body.audio.timestamp_ms > 1_700_000_000_000);
-
-    let audio = SignedResponse {
-        response: IntentMessage {
-            intent: AUDIO_INTENT,
-            timestamp_ms: body.audio.timestamp_ms,
-            data: measured,
-        },
-        signature: body.audio.signature,
-    };
-    verify_signed_response(&ctx.public_key(), AUDIO_INTENT, &audio)
-        .expect("audio signature verifies over the rebuilt intent message");
-}
-
-#[tokio::test]
-async fn bcs_intent_message_body_is_rejected_unsigned() {
-    let audio = measure(&fixture()).expect("fixture");
-    let message = intent_message(AUDIO_INTENT, 1_750_000_000_000, &audio).expect("BCS");
-    let response = app(context(), server_config(DEFAULT_MAX_BODY_BYTES), 2)
-        .expect("config")
-        .oneshot(post(Body::from(message)))
-        .await
-        .expect("response");
-    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
-    let value = json(response).await;
-    assert_eq!(value["error"], "application_error");
-    assert!(value["message"].as_str().expect("message").contains("fLaC"));
-    assert!(value.get("signature").is_none());
-    assert!(!value.to_string().contains("signature"));
-}
-
-#[tokio::test]
-async fn invalid_flac_is_rejected() {
-    let mut bytes = fixture();
-    bytes[30] ^= 1;
-    let response = app(context(), server_config(DEFAULT_MAX_BODY_BYTES), 2)
-        .expect("config")
-        .oneshot(post(Body::from(bytes)))
-        .await
-        .expect("response");
-    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
-    let value = json(response).await;
-    assert!(value.get("signature").is_none());
-}
-
-#[tokio::test]
-async fn body_limit_is_enforced() {
-    let response = app(context(), server_config(4), 2)
-        .expect("config")
-        .oneshot(post(Body::from(vec![0u8; 5])))
-        .await
-        .expect("response");
-    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
-}
-
-#[tokio::test]
-async fn second_upload_is_refused_while_one_is_in_flight() {
-    let router: Router = app(context(), server_config(DEFAULT_MAX_BODY_BYTES), 2).expect("config");
-    let (sender, receiver) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(1);
-    let stream = tokio_stream(receiver);
-    let mut first = Box::pin(router.clone().oneshot(post(Body::from_stream(stream))));
-    assert!(futures_util::poll!(&mut first).is_pending());
-
-    let response = router
-        .clone()
-        .oneshot(post(Body::from(fixture())))
-        .await
-        .expect("response");
-    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
-    assert_eq!(json(response).await["error"], "overloaded");
-
-    sender.send(Ok(Bytes::from(fixture()))).await.expect("send");
-    drop(sender);
-    let response = first.await.expect("response");
-    assert_eq!(response.status(), StatusCode::OK);
-
-    let response = router
-        .oneshot(post(Body::from(fixture())))
-        .await
-        .expect("response");
-    assert_eq!(response.status(), StatusCode::OK);
+async fn send(router: &Router, request: Request<Body>) -> (StatusCode, serde_json::Value) {
+    json(router.clone().oneshot(request).await.expect("response")).await
 }
 
 #[tokio::test]
 async fn health_check_reports_the_injected_identity() {
     let ctx = context();
-    let response = app(ctx.clone(), server_config(DEFAULT_MAX_BODY_BYTES), 2)
-        .expect("config")
-        .oneshot(
-            Request::builder()
-                .uri("/health_check")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(json(response).await["pk"], ctx.public_key_hex());
+    let router = app(ctx.clone(), DEFAULT_MAX_BODY_BYTES, 2);
+    let (status, value) = send(&router, request("GET", "/health_check", Body::empty())).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(value["pk"], ctx.public_key_hex());
+    assert_eq!(value["address"], ctx.sui_address());
+}
+
+#[tokio::test]
+async fn attestation_binds_the_nonce_and_the_key() {
+    let attestor = FakeAttestor::default();
+    let ctx = NautilusContext::with_signer(EnclaveIdentity::from_seed([9u8; 32]), attestor.clone());
+    let router = app(ctx.clone(), DEFAULT_MAX_BODY_BYTES, 2);
+    let body = r#"{ "nonce": "0a0b0c" }"#;
+    let (status, value) = send(&router, request("POST", "/attestation", body)).await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    let document = hex::decode(value["attestation"].as_str().expect("hex")).expect("hex");
+    let document: serde_json::Value = serde_json::from_slice(&document).expect("fake document");
+    assert_eq!(document["nonce"], "0a0b0c");
+    assert_eq!(document["public_key"], ctx.public_key_hex());
+    let requests = attestor.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].nonce.as_deref(), Some(&[10u8, 11, 12][..]));
+    assert_eq!(requests[0].user_data, None);
+}
+
+#[tokio::test]
+async fn attestation_requires_a_nonce() {
+    let router = router();
+    for body in [
+        "",
+        "{}",
+        r#"{ "nonce": "" }"#,
+        r#"{ "nonce": "zz" }"#,
+        r#"{ "nonce": "0a", "user_data": "0b" }"#,
+    ] {
+        let (status, value) = send(&router, request("POST", "/attestation", body)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}: {value}");
+        assert_eq!(value["error"], "invalid_request", "{body}");
+    }
+    let oversized = format!(r#"{{ "nonce": "{}" }}"#, "00".repeat(513));
+    let (status, value) = send(&router, request("POST", "/attestation", oversized)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let message = value["message"].as_str().expect("message");
+    assert!(message.contains("at most 512 bytes"), "{message}");
+}
+
+#[tokio::test]
+async fn attestation_body_is_bounded() {
+    let router = router();
+    let body = format!(
+        r#"{{ "nonce": "0a", "pad": "{}" }}"#,
+        " ".repeat(ATTESTATION_BODY_BYTES)
+    );
+    // A declared length over the limit is refused before any of the body is read.
+    let declared = Request::builder()
+        .method("POST")
+        .uri("/attestation")
+        .header(header::CONTENT_LENGTH, ATTESTATION_BODY_BYTES + 1)
+        .body(Body::from_stream(futures_util::stream::pending::<
+            Result<Bytes, std::io::Error>,
+        >()))
+        .expect("request");
+    let (status, value) = send(&router, declared).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(value["error"], "body_too_large");
+
+    // Without one, the body is refused once it delivers more than the limit.
+    let chunks: Vec<Result<Bytes, std::io::Error>> = body
+        .as_bytes()
+        .chunks(100)
+        .map(|chunk| Ok(Bytes::copy_from_slice(chunk)))
+        .collect();
+    let streamed = Body::from_stream(futures_util::stream::iter(chunks));
+    let (status, value) = send(&router, request("POST", "/attestation", streamed)).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(value["error"], "body_too_large");
+}
+
+/// An attestor that reports each attestation and blocks it until released.
+struct Gate {
+    entered: UnboundedSender<()>,
+    release: Mutex<mpsc::Receiver<()>>,
+}
+
+impl Attestor for Gate {
+    fn name(&self) -> &'static str {
+        "gate"
+    }
+
+    fn attest(&self, _request: AttestationRequest) -> Result<Vec<u8>, AttestationError> {
+        self.entered.send(()).expect("entered");
+        self.release.lock().expect("lock").recv().expect("released");
+        Err(AttestationError::Unavailable("closed".into()))
+    }
+
+    fn random(&self, len: usize) -> Result<Vec<u8>, AttestationError> {
+        Ok(vec![0; len])
+    }
+}
+
+#[tokio::test]
+async fn attestations_run_one_at_a_time() {
+    let (entered, mut attesting) = unbounded_channel();
+    let (release, gate) = mpsc::channel();
+    let gate = Gate {
+        entered,
+        release: Mutex::new(gate),
+    };
+    let ctx = NautilusContext::with_signer(EnclaveIdentity::from_seed([9u8; 32]), gate);
+    let router = app(ctx, DEFAULT_MAX_BODY_BYTES, 2);
+    let body = r#"{ "nonce": "0a" }"#;
+    let first = tokio::spawn(
+        router
+            .clone()
+            .oneshot(request("POST", "/attestation", body)),
+    );
+    attesting.recv().await.expect("attesting");
+
+    let (status, value) = send(&router, request("POST", "/attestation", body)).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(value["error"], "overloaded");
+    let health = request("GET", "/health_check", Body::empty());
+    assert_eq!(send(&router, health).await.0, StatusCode::OK);
+
+    release.send(()).expect("release");
+    let (status, value) = json(first.await.expect("task").expect("response")).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(value["error"], "attestation_unavailable");
+}
+
+#[tokio::test]
+async fn unknown_routes_and_methods_get_json_errors() {
+    let router = router();
+    for uri in ["/process_data", "/v1/other"] {
+        let (status, value) = send(&router, request("POST", uri, Body::empty())).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{uri}");
+        assert_eq!(value["error"], "not_found");
+    }
+    for (method, uri) in [
+        ("GET", "/attestation"),
+        ("GET", "/v1/measure"),
+        ("POST", "/health_check"),
+    ] {
+        let (status, value) = send(&router, request(method, uri, Body::empty())).await;
+        assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED, "{method} {uri}");
+        assert_eq!(value["error"], "method_not_allowed");
+    }
 }
 
 #[test]
@@ -198,50 +218,16 @@ fn max_body_bytes_resolution() {
     assert!(max_body_bytes(&[], Some("lots".into())).is_err());
 }
 
-fn tokio_stream(
-    mut receiver: tokio::sync::mpsc::Receiver<Result<Bytes, std::io::Error>>,
-) -> impl futures_util::Stream<Item = Result<Bytes, std::io::Error>> {
-    futures_util::stream::poll_fn(move |cx| receiver.poll_recv(cx))
-}
-
-#[test]
-fn server_config_serves_one_upload_within_the_request_deadline() {
-    let config = server_config(DEFAULT_MAX_BODY_BYTES);
-    assert_eq!(config.max_concurrent, 1);
-    assert!(config.body_read_timeout < config.request_timeout);
-    assert_eq!(config.max_connections, 256);
-    assert!(!config.allow_unnonced_attestation);
-    config.validate().expect("valid");
-}
-
-#[test]
-fn zero_body_limit_is_a_config_error() {
-    assert_eq!(
-        app(context(), server_config(0), 2).err(),
-        Some(ConfigError::Zero("max_body_bytes"))
-    );
-}
-
-#[tokio::test]
-async fn excessive_decoded_work_is_rejected_unsigned() {
-    let mut bytes = fixture();
-    // Preserve format fields and replace the 36-bit sample count with its maximum.
-    bytes[21] |= 0x0f;
-    bytes[22..26].fill(0xff);
-    let response = app(context(), server_config(DEFAULT_MAX_BODY_BYTES), 2)
-        .expect("config")
-        .oneshot(post(Body::from(bytes)))
-        .await
-        .expect("response");
-    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
-    let value = json(response).await;
-    assert!(value["message"].as_str().unwrap().contains("decoded PCM"));
-    assert!(value.get("signature").is_none());
-}
-
 #[test]
 fn ambiguous_or_zero_body_limits_are_rejected() {
     assert!(max_body_bytes(&[], Some("0".into())).is_err());
     let args = ["--max-body-bytes", "1024", "--max-body-bytes", "2048"].map(String::from);
     assert!(max_body_bytes(&args, None).is_err());
+}
+
+#[test]
+fn server_config_limits_connections() {
+    let config = server_config();
+    assert_eq!(config.max_connections, 256);
+    config.validate().expect("valid");
 }
