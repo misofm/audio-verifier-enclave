@@ -2,7 +2,9 @@
 # Re-vendors the libFLAC 1.5.0 stream-decoder sources into crates/libflac from the
 # upstream release archive, checking its SHA-256 first. Only the decoder's
 # compilation units and the headers they include are kept; the encoder, Ogg,
-# metadata editing and file I/O helpers are not.
+# metadata editing and file I/O helpers are not. The patches in
+# crates/libflac/patches are then applied in order; each one's header says what
+# it changes and why.
 #
 # usage: scripts/vendor-libflac.sh path/to/flac-1.5.0.tar.xz
 set -eu
@@ -63,3 +65,7 @@ src/libFLAC/md5.c
 src/libFLAC/memory.c
 src/libFLAC/stream_decoder.c
 EOF
+
+for patch in "$root"/crates/libflac/patches/*.patch; do
+	patch -d "$dest" -p1 --no-backup-if-mismatch --forward < "$patch"
+done
