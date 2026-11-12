@@ -1,7 +1,8 @@
+use std::io::Read;
 use std::sync::mpsc;
 use std::{panic, thread};
 
-use libflac::{Frame, Handler};
+use libflac::{Frame, Handler, ReaderStats};
 use md5::{Digest as _, Md5};
 
 use crate::frame_header::{self, FrameHeader};
@@ -10,6 +11,35 @@ use crate::{Error, StreamInfo};
 const PIPELINE_DEPTH: usize = 4;
 
 pub(crate) fn verify_and_digest(bytes: &[u8], info: &StreamInfo) -> Result<[u8; 32], Error> {
+    verify(info, |checker| {
+        libflac::decode(bytes, checker).map(|summary| (summary, bytes.len() as u64))
+    })
+}
+
+/// As [`verify_and_digest`], over a stream read front to back in a bounded window.
+pub(crate) fn verify_and_digest_reader<R: Read>(
+    reader: R,
+    info: &StreamInfo,
+) -> Result<([u8; 32], ReaderStats), Error> {
+    let mut stats = None;
+    let digest = verify(info, |checker| {
+        libflac::decode_reader(reader, checker).map(|(summary, read)| {
+            stats = Some(read);
+            (summary, read.len)
+        })
+    })?;
+    Ok((
+        digest,
+        stats.expect("a successful decode reports its reads"),
+    ))
+}
+
+type Decoded = Result<(libflac::Summary, u64), libflac::Error<Error>>;
+
+fn verify(
+    info: &StreamInfo,
+    decode: impl FnOnce(&mut Canonical<'_>) -> Decoded,
+) -> Result<[u8; 32], Error> {
     let (full, filled) = mpsc::sync_channel::<Vec<u8>>(PIPELINE_DEPTH);
     let (empty, recycled) = mpsc::sync_channel::<Vec<u8>>(PIPELINE_DEPTH);
     for _ in 0..PIPELINE_DEPTH {
@@ -31,9 +61,10 @@ pub(crate) fn verify_and_digest(bytes: &[u8], info: &StreamInfo) -> Result<[u8; 
             (md5, *blake3.finalize().as_bytes())
         });
         let mut checker = Canonical::new(info, &full, &recycled);
-        let checked = match libflac::decode(bytes, &mut checker) {
-            Ok(summary) => checker.finish(bytes, summary),
+        let checked = match decode(&mut checker) {
+            Ok((summary, len)) => checker.finish(len, summary),
             Err(libflac::Error::Handler(error)) => Err(error),
+            Err(libflac::Error::Read(error)) => Err(Error::Read(error.to_string())),
             // libFLAC reports a gap only after reading the next frame in full,
             // where the previous frame's block size is checked first.
             Err(
@@ -213,11 +244,11 @@ impl<'a> Canonical<'a> {
     }
 
     /// The end-of-stream checks. Returns the decoded samples per channel.
-    fn finish(&self, bytes: &[u8], summary: libflac::Summary) -> Result<u64, Error> {
-        if summary.end != bytes.len() as u64 {
+    fn finish(&self, len: u64, summary: libflac::Summary) -> Result<u64, Error> {
+        if summary.end != len {
             return Err(Error::Decode(format!(
                 "{} bytes after the last complete frame at byte {}",
-                bytes.len() as u64 - summary.end,
+                len - summary.end,
                 summary.end
             )));
         }
@@ -317,6 +348,6 @@ fn pack<const B: usize>(channels: &[&[i32]], out: &mut Vec<u8>) {
     }
 }
 
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }

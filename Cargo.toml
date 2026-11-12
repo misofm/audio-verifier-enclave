@@ -24,6 +24,7 @@ md-5 = "0.10.6"
 nautilus = { git = "https://github.com/unconfirmedlabs/nautilus-rust", rev = "46a9d27777bc749f76eb5ae1360eb77d2361a94d" }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
+sha2 = "0.10.9"
 thiserror = "2.0.18"
 tokio = { version = "1.52.1", features = ["macros", "net", "rt-multi-thread", "signal", "sync"] }
 tower = { version = "0.5.2", features = ["util"] }

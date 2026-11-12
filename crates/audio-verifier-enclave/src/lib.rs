@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use audio_verifier::{AudioPayload, StreamInfo, measure};
+use audio_verifier::{AudioPayload, measure};
 use axum::{Router, body::Bytes};
 use nautilus::{ConfigError, Intent, NautilusContext, NautilusError, ServerConfig, SignedResponse};
 use serde::{Deserialize, Serialize};
@@ -12,8 +12,7 @@ pub const AUDIO_INTENT: Intent = Intent(0);
 pub const DEFAULT_MAX_BODY_BYTES: usize = 256 * 1024 * 1024;
 
 /// Maximum decoded PCM work per request, including all channels (4 GiB).
-/// Compressed uploads can otherwise expand to terabytes of hashing work.
-pub const MAX_DECODED_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+pub use audio_verifier::MAX_DECODED_BYTES;
 
 /// Deadline for one upload and measurement.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
@@ -106,18 +105,6 @@ pub fn response(ctx: &NautilusContext, audio: SignedResponse<AudioPayload>) -> P
 
 /// Measures `bytes` and signs the audio facts.
 pub fn process(bytes: &[u8], ctx: &NautilusContext) -> Result<ProcessDataResponse, NautilusError> {
-    let info = StreamInfo::parse_canonical(bytes)
-        .and_then(|info| info.validate().map(|()| info))
-        .map_err(|error| NautilusError::application(error.to_string()))?;
-    let decoded_bytes = info
-        .total_samples
-        .checked_mul(u64::from(info.channels))
-        .and_then(|samples| samples.checked_mul(info.bytes_per_sample() as u64));
-    if decoded_bytes.is_none_or(|size| size > MAX_DECODED_BYTES) {
-        return Err(NautilusError::application(
-            "decoded PCM exceeds the 4 GiB service limit",
-        ));
-    }
     let audio = measure(bytes).map_err(|error| NautilusError::application(error.to_string()))?;
     let audio = ctx.sign_intent(AUDIO_INTENT, audio)?;
     Ok(response(ctx, audio))

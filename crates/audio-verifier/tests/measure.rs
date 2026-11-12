@@ -1,15 +1,62 @@
 mod common;
 
-use audio_verifier::{AudioPayload, Error};
+use std::io::{self, Read};
+
+use audio_verifier::{AudioPayload, Error, FileStats, measure_reader};
 use common::{
     FrameEdit, FrameHeader, Rate, Synth, block_sizes, decoded_samples, ffmpeg, ffmpeg_raw_pcm,
     fixture, frame_sizes, pcm_md5, scratch_file, set_block_sizes, set_frame_sizes, set_md5,
     set_streaminfo, utf8_number,
 };
+use sha2::{Digest as _, Sha256};
 
+/// Hands out at most `chunk` bytes per read, as a network body does.
+struct Chunked<'a> {
+    bytes: &'a [u8],
+    at: usize,
+    chunk: usize,
+}
+
+impl<'a> Chunked<'a> {
+    fn new(bytes: &'a [u8], chunk: usize) -> Self {
+        Self {
+            bytes,
+            at: 0,
+            chunk,
+        }
+    }
+}
+
+impl Read for Chunked<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let count = buffer.len().min(self.chunk).min(self.bytes.len() - self.at);
+        buffer[..count].copy_from_slice(&self.bytes[self.at..self.at + count]);
+        self.at += count;
+        Ok(count)
+    }
+}
+
+/// Chunk sizes every case of this suite is also streamed in: one byte, an odd size, a page,
+/// the decoder's release threshold, and the whole file in one read.
+const CHUNKS: [usize; 5] = [1, 7, 4096, 1 << 20, usize::MAX];
+
+fn measure_streamed(bytes: &[u8], chunk: usize) -> Result<(AudioPayload, FileStats), Error> {
+    measure_reader(Chunked::new(bytes, chunk))
+}
+
+// Every case of this suite also runs streamed, in each of `CHUNKS`, and must reach the same
+// verdict, error included, and report the file's length and SHA-256.
 // Optional migration evidence from the same inputs and assertions as this suite.
 fn measure(bytes: &[u8]) -> Result<AudioPayload, Error> {
     let result = audio_verifier::measure(bytes);
+    for chunk in CHUNKS {
+        let streamed = measure_streamed(bytes, chunk).map(|(audio, stats)| {
+            assert_eq!(stats.len, bytes.len() as u64, "chunks of {chunk}");
+            assert_eq!(stats.sha256, <[u8; 32]>::from(Sha256::digest(bytes)));
+            audio
+        });
+        assert_eq!(streamed, result, "streamed in chunks of {chunk} bytes");
+    }
     if let Some(directory) = std::env::var_os("AUDIO_VERIFIER_MIGRATION_RESULTS") {
         let directory = std::path::PathBuf::from(directory);
         std::fs::create_dir_all(&directory).expect("migration directory");
@@ -773,4 +820,51 @@ fn rejects_sample_overrun_on_the_first_frame() {
         }
         error => panic!("unexpected error: {error:?}"),
     }
+}
+
+#[test]
+fn rejects_excessive_decoded_work_before_decoding() {
+    let mut bytes = fixture("s16_stereo_44100.flac");
+    // Preserve format fields and replace the 36-bit sample count with its maximum.
+    bytes[21] |= 0x0f;
+    bytes[22..26].fill(0xff);
+    assert_eq!(rejects(&bytes), Error::DecodedTooLarge);
+    // Rejected from STREAMINFO alone: the frames are never read.
+    assert_eq!(rejects(&bytes[..42]), Error::DecodedTooLarge);
+}
+
+#[test]
+fn streamed_window_stays_bounded() {
+    let bytes = fixture("libflac_s24_stereo_96000.flac");
+    for chunk in CHUNKS {
+        let (_, stats) = measure_streamed(&bytes, chunk).expect("fixture");
+        assert!(stats.peak_held <= bytes.len(), "{stats:?}");
+    }
+    let mut long = Synth::new(2, 24, 96_000);
+    long.block_size = 4_096;
+    long.frames_per_channel = 200 * 4_096;
+    let bytes = long.build();
+    assert!(bytes.len() > 3 << 20, "{} bytes", bytes.len());
+    let (_, stats) = measure_streamed(&bytes, 65_536).expect("long file");
+    assert!(stats.peak_held <= (1 << 20) + (256 << 10), "{stats:?}");
+}
+
+#[test]
+fn streamed_read_error_is_rejected() {
+    struct Failing;
+    impl Read for Failing {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::other("connection reset"))
+        }
+    }
+    let bytes = fixture("s16_stereo_44100.flac");
+    let reader = Chunked::new(&bytes[..bytes.len() / 2], 4096).chain(Failing);
+    assert_eq!(
+        measure_reader(reader),
+        Err(Error::Read("connection reset".into()))
+    );
+    assert_eq!(
+        measure_reader(Failing),
+        Err(Error::Read("connection reset".into()))
+    );
 }

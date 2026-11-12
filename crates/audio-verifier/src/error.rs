@@ -36,6 +36,12 @@ pub enum Error {
     /// STREAMINFO block sizes break `16 <= min_block_size <= max_block_size`.
     #[error("STREAMINFO block sizes {min} to {max} are not within 16 to 65535 in order")]
     BlockSizeBounds { min: u16, max: u16 },
+    /// STREAMINFO declares more decoded PCM than [`MAX_DECODED_BYTES`](crate::MAX_DECODED_BYTES).
+    #[error("decoded PCM exceeds the 4 GiB service limit")]
+    DecodedTooLarge,
+    /// Reading a streamed file failed.
+    #[error("reading the input failed: {0}")]
+    Read(String),
     /// Decoder error.
     #[error("FLAC decode failed: {0}")]
     Decode(String),

@@ -1,4 +1,4 @@
-use crate::{Error, StreamInfo, decode};
+use crate::{Error, decode::hex, measure};
 
 const KNOWN_PCM_DIGESTS: [(&str, &[u8], &str); 2] = [
     (
@@ -17,10 +17,8 @@ const KNOWN_PCM_DIGESTS: [(&str, &[u8], &str); 2] = [
 /// a build that computes wrongly on this CPU can refuse to start.
 pub fn self_test() -> Result<(), Error> {
     for (name, flac, expected) in KNOWN_PCM_DIGESTS {
-        let info = StreamInfo::parse_canonical(flac)?;
-        info.validate()?;
-        let digest = decode::verify_and_digest(flac, &info)?;
-        if blake3::Hash::from(digest).to_hex().as_str() != expected {
+        let digest = measure(flac)?.pcm_digest;
+        if hex(&digest) != expected {
             return Err(Error::SelfTest(name));
         }
     }
