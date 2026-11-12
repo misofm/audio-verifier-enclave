@@ -2,7 +2,10 @@
 //! vendored release sources in `flac-1.5.0/`.
 //!
 //! [`decode`] runs libFLAC over an in-memory stream and hands each decoded frame,
-//! with its exact byte range, to a [`Handler`]. Unlike libFLAC's default
+//! with its exact byte range, to a [`Handler`]. [`decode_reader`] does the same
+//! over any [`Read`], front to back, holding only a bounded window of the input:
+//! from the end of the last complete frame to libFLAC's read position, dropped
+//! once 1 MiB of finished frames has accumulated. Unlike libFLAC's default
 //! behaviour, decoding is strict: the first error libFLAC reports ends it, so
 //! libFLAC never resynchronises, skips bytes or fills missing frames with silence
 //! on the handler's behalf.
@@ -13,6 +16,7 @@ use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::ffi::{c_int, c_void};
 use std::fmt;
+use std::io::{self, Read};
 use std::panic::{self, AssertUnwindSafe};
 use std::{ptr, slice};
 
@@ -137,6 +141,9 @@ pub enum Error<E> {
     /// libFLAC stopped in a state other than end of stream.
     #[error("libFLAC decoder stopped in state {}", state_name(*.0))]
     State(c_int),
+    /// The reader of [`decode_reader`] failed.
+    #[error("reading the input failed: {0}")]
+    Read(io::Error),
 }
 
 /// How a successful [`decode`] ended.
@@ -155,9 +162,128 @@ pub struct Summary {
 ///
 /// A panic in `handler` is resumed on the caller's thread after libFLAC returns.
 pub fn decode<H: Handler>(input: &[u8], handler: &mut H) -> Result<Summary, Error<H::Error>> {
+    run(Slice { input, read: 0 }, handler).map(|(summary, _)| summary)
+}
+
+/// What [`decode_reader`] read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReaderStats {
+    /// Bytes read from the reader, all of it: decoding ends only at its end.
+    pub len: u64,
+    /// The most input bytes held at once.
+    pub peak_held: usize,
+}
+
+/// Bytes of finished frames kept before they are dropped in one move.
+const RELEASE_THRESHOLD: usize = 1 << 20;
+
+/// Decodes the stream `reader` gives, front to back, as [`decode`] does, holding only the
+/// input from the end of the last complete frame to libFLAC's read position.
+pub fn decode_reader<R: Read, H: Handler>(
+    reader: R,
+    handler: &mut H,
+) -> Result<(Summary, ReaderStats), Error<H::Error>> {
+    let window = Window {
+        reader,
+        held: Vec::new(),
+        base: 0,
+        peak: 0,
+    };
+    run(window, handler).map(|(summary, window)| {
+        (
+            summary,
+            ReaderStats {
+                len: window.position(),
+                peak_held: window.peak,
+            },
+        )
+    })
+}
+
+/// Where a session's bytes come from.
+trait Input {
+    /// Copies the next bytes of the stream into `buffer`, returning how many; 0 at its end.
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize>;
+    /// The stream's bytes `start..end`, if they are still held.
+    fn bytes(&self, start: u64, end: u64) -> Option<&[u8]>;
+    /// Bytes before `offset` will not be asked for again.
+    fn release(&mut self, offset: u64);
+    /// Bytes read so far.
+    fn position(&self) -> u64;
+}
+
+struct Slice<'a> {
+    input: &'a [u8],
+    read: usize,
+}
+
+impl Input for Slice<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let remaining = &self.input[self.read..];
+        let count = remaining.len().min(buffer.len());
+        buffer[..count].copy_from_slice(&remaining[..count]);
+        self.read += count;
+        Ok(count)
+    }
+
+    fn bytes(&self, start: u64, end: u64) -> Option<&[u8]> {
+        let start = usize::try_from(start).ok()?;
+        let end = usize::try_from(end).ok()?;
+        self.input.get(start..end)
+    }
+
+    fn release(&mut self, _offset: u64) {}
+
+    fn position(&self) -> u64 {
+        self.read as u64
+    }
+}
+
+/// A forward-only reader that keeps its bytes from the last release to the read position.
+struct Window<R> {
+    reader: R,
+    held: Vec<u8>,
+    /// Stream offset of `held[0]`.
+    base: u64,
+    peak: usize,
+}
+
+impl<R: Read> Input for Window<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let count = loop {
+            match self.reader.read(buffer) {
+                Ok(count) => break count,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
+        };
+        self.held.extend_from_slice(&buffer[..count]);
+        self.peak = self.peak.max(self.held.len());
+        Ok(count)
+    }
+
+    fn bytes(&self, start: u64, end: u64) -> Option<&[u8]> {
+        let start = usize::try_from(start.checked_sub(self.base)?).ok()?;
+        let end = usize::try_from(end.checked_sub(self.base)?).ok()?;
+        self.held.get(start..end)
+    }
+
+    fn release(&mut self, offset: u64) {
+        let dead = offset.saturating_sub(self.base).min(self.held.len() as u64) as usize;
+        if dead >= RELEASE_THRESHOLD || dead == self.held.len() {
+            self.held.drain(..dead);
+            self.base += dead as u64;
+        }
+    }
+
+    fn position(&self) -> u64 {
+        self.base + self.held.len() as u64
+    }
+}
+
+fn run<I: Input, H: Handler>(input: I, handler: &mut H) -> Result<(Summary, I), Error<H::Error>> {
     let session = Session {
-        input,
-        read: Cell::new(0),
+        input: RefCell::new(input),
         handler: RefCell::new(handler),
         stream_info: Cell::new(false),
         frames: Cell::new(0),
@@ -175,14 +301,14 @@ pub fn decode<H: Handler>(input: &[u8], handler: &mut H) -> Result<Summary, Erro
     let status = unsafe {
         ffi::FLAC__stream_decoder_init_stream(
             decoder.0,
-            Some(read::<H>),
+            Some(read::<I, H>),
             None,
-            Some(tell::<H>),
+            Some(tell::<I, H>),
             None,
             None,
-            Some(write::<H>),
-            Some(metadata::<H>),
-            Some(error::<H>),
+            Some(write::<I, H>),
+            Some(metadata::<I, H>),
+            Some(error::<I, H>),
             client_data,
         )
     };
@@ -208,10 +334,12 @@ pub fn decode<H: Handler>(input: &[u8], handler: &mut H) -> Result<Summary, Erro
     if state != ffi::STATE_END_OF_STREAM {
         return Err(Error::State(state));
     }
-    Ok(Summary {
+    let summary = Summary {
         frames: session.frames.get(),
         end: session.end.get(),
-    })
+    };
+    drop(decoder);
+    Ok((summary, session.input.into_inner()))
 }
 
 /// Owns a libFLAC decoder.
@@ -248,10 +376,8 @@ fn position(decoder: *const ffi::StreamDecoder) -> Option<u64> {
 }
 
 /// State shared with the callbacks, which see it only through `&Session`.
-struct Session<'a, H: Handler> {
-    input: &'a [u8],
-    /// Bytes handed to libFLAC so far.
-    read: Cell<usize>,
+struct Session<'a, I, H: Handler> {
+    input: RefCell<I>,
     handler: RefCell<&'a mut H>,
     stream_info: Cell<bool>,
     frames: Cell<u64>,
@@ -262,7 +388,7 @@ struct Session<'a, H: Handler> {
     panic: Cell<Option<Box<dyn Any + Send>>>,
 }
 
-impl<H: Handler> Session<'_, H> {
+impl<I, H: Handler> Session<'_, I, H> {
     fn failed(&self) -> bool {
         self.failure.borrow().is_some()
     }
@@ -309,33 +435,36 @@ impl<H: Handler> Session<'_, H> {
 /// # Safety
 ///
 /// `client_data` must be the `Session<H>` passed to `decode`'s `init_stream`.
-unsafe fn session<'s, 'a, H: Handler>(client_data: *mut c_void) -> &'s Session<'a, H> {
+unsafe fn session<'s, 'a, I, H: Handler>(client_data: *mut c_void) -> &'s Session<'a, I, H> {
     // SAFETY: guaranteed by the caller; the session outlives the decoder.
-    unsafe { &*client_data.cast::<Session<'a, H>>() }
+    unsafe { &*client_data.cast::<Session<'a, I, H>>() }
 }
 
-unsafe extern "C" fn read<H: Handler>(
+unsafe extern "C" fn read<I: Input, H: Handler>(
     _decoder: *const ffi::StreamDecoder,
     buffer: *mut u8,
     bytes: *mut usize,
     client_data: *mut c_void,
 ) -> c_int {
     // SAFETY: libFLAC passes back the client data given to `init_stream`.
-    let session = unsafe { session::<H>(client_data) };
+    let session = unsafe { session::<I, H>(client_data) };
     if session.failed() {
         return ffi::READ_STATUS_ABORT;
     }
-    let remaining = &session.input[session.read.get()..];
     // SAFETY: libFLAC passes a valid in/out byte count.
     let capacity = unsafe { *bytes };
-    let count = remaining.len().min(capacity);
-    // SAFETY: `buffer` has room for `capacity >= count` bytes, and it does not
-    // overlap the input slice.
-    unsafe {
-        ptr::copy_nonoverlapping(remaining.as_ptr(), buffer, count);
-        *bytes = count;
-    }
-    session.read.set(session.read.get() + count);
+    // SAFETY: `buffer` has room for `capacity` bytes for the callback's duration
+    // and overlaps nothing the input holds.
+    let buffer = unsafe { slice::from_raw_parts_mut(buffer, capacity) };
+    let count = match session.input.borrow_mut().read(buffer) {
+        Ok(count) => count,
+        Err(error) => {
+            session.fail(Error::Read(error));
+            return ffi::READ_STATUS_ABORT;
+        }
+    };
+    // SAFETY: libFLAC passes a valid in/out byte count.
+    unsafe { *bytes = count };
     if count == 0 {
         ffi::READ_STATUS_END_OF_STREAM
     } else {
@@ -343,25 +472,25 @@ unsafe extern "C" fn read<H: Handler>(
     }
 }
 
-unsafe extern "C" fn tell<H: Handler>(
+unsafe extern "C" fn tell<I: Input, H: Handler>(
     _decoder: *const ffi::StreamDecoder,
     offset: *mut u64,
     client_data: *mut c_void,
 ) -> c_int {
     // SAFETY: libFLAC passes back the client data given to `init_stream`.
-    let session = unsafe { session::<H>(client_data) };
+    let session = unsafe { session::<I, H>(client_data) };
     // SAFETY: libFLAC passes a valid out-pointer.
-    unsafe { *offset = session.read.get() as u64 };
+    unsafe { *offset = session.input.borrow().position() };
     ffi::TELL_STATUS_OK
 }
 
-unsafe extern "C" fn metadata<H: Handler>(
+unsafe extern "C" fn metadata<I, H: Handler>(
     _decoder: *const ffi::StreamDecoder,
     block: *const ffi::StreamMetadata,
     client_data: *mut c_void,
 ) {
     // SAFETY: libFLAC passes back the client data given to `init_stream`.
-    let session = unsafe { session::<H>(client_data) };
+    let session = unsafe { session::<I, H>(client_data) };
     // SAFETY: libFLAC passes a valid metadata block for the callback's duration.
     let block = unsafe { &*block };
     if session.failed() || block.type_ != ffi::METADATA_TYPE_STREAMINFO {
@@ -386,14 +515,14 @@ unsafe extern "C" fn metadata<H: Handler>(
     session.call(|handler| handler.stream_info(&info));
 }
 
-unsafe extern "C" fn write<H: Handler>(
+unsafe extern "C" fn write<I: Input, H: Handler>(
     decoder: *const ffi::StreamDecoder,
     header: *const ffi::FrameHeader,
     buffer: *const *const i32,
     client_data: *mut c_void,
 ) -> c_int {
     // SAFETY: libFLAC passes back the client data given to `init_stream`.
-    let session = unsafe { session::<H>(client_data) };
+    let session = unsafe { session::<I, H>(client_data) };
     if session.failed() {
         return ffi::WRITE_STATUS_ABORT;
     }
@@ -403,11 +532,9 @@ unsafe extern "C" fn write<H: Handler>(
         return ffi::WRITE_STATUS_ABORT;
     };
     let start = session.end.get();
-    let Some(bytes) = usize::try_from(start)
-        .ok()
-        .zip(usize::try_from(end).ok())
-        .and_then(|(start, end)| session.input.get(start..end))
-    else {
+    let input = session.input.borrow();
+    let Some(bytes) = input.bytes(start, end) else {
+        drop(input);
         session.fail(Error::DecodePosition);
         return ffi::WRITE_STATUS_ABORT;
     };
@@ -433,21 +560,24 @@ unsafe extern "C" fn write<H: Handler>(
         bytes,
         samples: &samples[..channels.min(MAX_CHANNELS)],
     };
-    if !session.call(|handler| handler.frame(&frame)) {
+    let handled = session.call(|handler| handler.frame(&frame));
+    drop(input);
+    if !handled {
         return ffi::WRITE_STATUS_ABORT;
     }
+    session.input.borrow_mut().release(end);
     session.end.set(end);
     session.frames.set(session.frames.get() + 1);
     ffi::WRITE_STATUS_CONTINUE
 }
 
-unsafe extern "C" fn error<H: Handler>(
+unsafe extern "C" fn error<I, H: Handler>(
     _decoder: *const ffi::StreamDecoder,
     status: c_int,
     client_data: *mut c_void,
 ) {
     // SAFETY: libFLAC passes back the client data given to `init_stream`.
-    let session = unsafe { session::<H>(client_data) };
+    let session = unsafe { session::<I, H>(client_data) };
     session.fail(Error::Stream {
         status: ErrorStatus::from_raw(status),
         frame: session.frames.get(),

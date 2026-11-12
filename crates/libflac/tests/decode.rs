@@ -1,6 +1,7 @@
+use std::io::{self, Read};
 use std::panic;
 
-use libflac::{Error, ErrorStatus, Frame, Handler, StreamInfo, decode};
+use libflac::{Error, ErrorStatus, Frame, Handler, StreamInfo, decode, decode_reader};
 
 const FIXTURE: &[u8] =
     include_bytes!("../../audio-verifier/tests/fixtures/libflac_s16_stereo_44100.flac");
@@ -155,4 +156,80 @@ fn trailing_garbage_is_lost_sync() {
 fn input_without_streaminfo_is_rejected() {
     let error = decode(b"not flac at all", &mut Record::default()).expect_err("not FLAC");
     assert!(!matches!(error, Error::Handler(_)), "{error:?}");
+}
+
+/// Hands out at most `chunk` bytes per read, then fails at `fail_at` if set.
+struct Chunked<'a> {
+    bytes: &'a [u8],
+    at: usize,
+    chunk: usize,
+    fail_at: Option<usize>,
+}
+
+impl<'a> Chunked<'a> {
+    fn new(bytes: &'a [u8], chunk: usize) -> Self {
+        Self {
+            bytes,
+            at: 0,
+            chunk,
+            fail_at: None,
+        }
+    }
+}
+
+impl Read for Chunked<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if self.fail_at.is_some_and(|at| self.at >= at) {
+            return Err(io::Error::other("connection reset"));
+        }
+        let end = self.fail_at.unwrap_or(self.bytes.len());
+        let count = buffer.len().min(self.chunk).min(end - self.at);
+        buffer[..count].copy_from_slice(&self.bytes[self.at..self.at + count]);
+        self.at += count;
+        Ok(count)
+    }
+}
+
+#[test]
+fn reader_decodes_the_same_frames_as_the_slice() {
+    let mut whole = Record::default();
+    let summary = decode(FIXTURE, &mut whole).expect("decode");
+    for chunk in [1, 7, 4096, usize::MAX] {
+        let mut streamed = Record::default();
+        let (streamed_summary, stats) =
+            decode_reader(Chunked::new(FIXTURE, chunk), &mut streamed).expect("decode_reader");
+        assert_eq!(streamed_summary, summary, "chunk {chunk}");
+        assert_eq!(streamed.info, whole.info, "chunk {chunk}");
+        assert_eq!(streamed.frames, whole.frames, "chunk {chunk}");
+        assert_eq!(stats.len, FIXTURE.len() as u64);
+        assert!(stats.peak_held <= FIXTURE.len(), "{stats:?}");
+    }
+}
+
+#[test]
+fn reader_reaches_the_slice_verdict_on_bad_input() {
+    let mut corrupt = FIXTURE.to_vec();
+    let middle = corrupt.len() / 2;
+    corrupt[middle] ^= 0x01;
+    let mut trailing = FIXTURE.to_vec();
+    trailing.extend_from_slice(b"TAG trailing bytes");
+    for input in [&corrupt[..], &trailing[..], &FIXTURE[..FIXTURE.len() - 1]] {
+        let expected = format!("{:?}", decode(input, &mut Record::default()));
+        let streamed = decode_reader(Chunked::new(input, 7), &mut Record::default())
+            .map(|(summary, _)| summary);
+        assert_eq!(format!("{streamed:?}"), expected);
+    }
+}
+
+#[test]
+fn reader_error_ends_decoding() {
+    let mut reader = Chunked::new(FIXTURE, 4096);
+    reader.fail_at = Some(FIXTURE.len() / 2);
+    let mut record = Record::default();
+    let error = decode_reader(reader, &mut record).expect_err("read error");
+    assert!(
+        matches!(&error, Error::Read(error) if error.to_string() == "connection reset"),
+        "{error:?}"
+    );
+    assert!(!record.frames.is_empty());
 }
