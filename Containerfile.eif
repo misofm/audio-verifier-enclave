@@ -9,19 +9,15 @@
 # those four, the enclave never boots on Nitro (no console, no heartbeat).
 
 FROM stagex/core-binutils@sha256:9fedf2687ad85efab8da71417bfbe78659db5295ee4e288df3a04315e3b687ac AS core-binutils
-FROM stagex/core-ca-certificates@sha256:4d901fb99baee5f461ede66e37edf2505d9d367222feded99e80892b1940f710 AS core-ca-certificates
 FROM stagex/core-gcc@sha256:0e382ec440f4e858d8156088196f588fa935b689bfde4130d7cc6bed74c6fc10 AS core-gcc
-FROM stagex/core-git@sha256:e87793fb81c2d9f24784a5674a2c0160fae0d823b17d7fafb5e69846a71730e5 AS core-git
 FROM stagex/core-zlib@sha256:130afab57ac8e9a9eb1e0c6e2c91758a67f731634d3cdb45ae04ea0534cc3930 AS core-zlib
 FROM stagex/core-libffi@sha256:c1efa10f13e4a416353b958d82b4e268aa04c723c66cb6a17006df0f4c4134aa AS core-libffi
 FROM stagex/core-llvm@sha256:828af54c098f1b302bfe73b02e71d5fcf363fe9ff31ea0e51ffb43689d77c6f3 AS core-llvm
 FROM stagex/core-libcxx@sha256:733ddf3bf6a47ba39578bec31d30804db134fa72482e8dbf4fcf288788d8a5b4 AS core-libcxx
 FROM stagex/core-libcxxabi@sha256:88e66348a0eb2b1c0a321aaac138aef4ccc4bbd13a16ffd1de0231d5506f66b3 AS core-libcxxabi
-FROM stagex/core-openssl@sha256:decacae13674bebbeaef3ce79c5d1159ae8495f272f8fa7e5db660c84ab37d1d AS core-openssl
 FROM stagex/core-rust@sha256:afd1cad50f1beff37d41d756e4ebf606b7a100119e96d3c1b140fa6b27386034 AS core-rust
 FROM stagex/core-musl@sha256:816a6e097544c23386c95c8614e358ace7c5026c3f53b7b9353b84cbb4ed0096 AS core-musl
 FROM stagex/core-libunwind@sha256:c76fcc66148b19230247b7cdba06040dbe2f47aa19d7a4be4d430db15d47e4b8 AS core-libunwind
-FROM stagex/core-pkgconf@sha256:437751215006901bd9a31720de95fa10e294b585abbfe78436310cec481884e4 AS core-pkgconf
 FROM stagex/core-busybox@sha256:d608daa946e4799cf28b105aba461db00187657bd55ea7c2935ff11dac237e27 AS core-busybox
 FROM stagex/core-libzstd@sha256:dd234de20cd651715ffc67ced1bb06cc3ac3011d881055beda335869d7d4210f AS core-libzstd
 FROM stagex/user-eif_build@sha256:935032172a23772ea1a35c6334aa98aa7b0c46f9e34a040347c7b2a73496ef8a AS user-eif_build
@@ -34,13 +30,9 @@ FROM scratch AS base
 COPY --from=core-busybox . /
 COPY --from=core-musl . /
 COPY --from=core-libunwind . /
-COPY --from=core-openssl . /
 COPY --from=core-zlib . /
-COPY --from=core-ca-certificates . /
 COPY --from=core-libzstd . /
 COPY --from=core-binutils . /
-COPY --from=core-pkgconf . /
-COPY --from=core-git . /
 COPY --from=core-rust . /
 COPY --from=user-gen_initramfs . /
 COPY --from=user-eif_build . /
@@ -76,12 +68,9 @@ RUN cargo build --locked --release --target "$TARGET" -p audio-verifier-enclave
 WORKDIR /build_cpio
 ENV KBUILD_BUILD_TIMESTAMP=1
 RUN mkdir initramfs
-COPY --from=core-busybox . initramfs
-COPY --from=core-musl . initramfs
 COPY --from=user-nit /bin/init initramfs/init
 RUN cp "/workspace/target/${TARGET}/release/audio-verifier-enclave" initramfs/nautilus-app
-RUN cp /workspace/eif/run.sh initramfs/run.sh
-RUN chmod +x initramfs/nautilus-app initramfs/run.sh
+RUN chmod +x initramfs/nautilus-app
 
 RUN <<-EOF
 	set -eux
@@ -107,7 +96,7 @@ RUN eif_build \
 	--ramdisk /build_cpio/rootfs.cpio \
 	--pcrs_output /nitro.pcrs \
 	--output /nitro.eif \
-	--cmdline "reboot=k initrd=0x2000000,$(wc -c < /build_cpio/rootfs.cpio) root=/dev/ram0 panic=1 pci=off nomodules console=ttyS0 i8042.noaux i8042.nomux i8042.nopnp i8042.dumbkbd nit.target=/run.sh"
+	--cmdline "reboot=k initrd=0x2000000,$(wc -c < /build_cpio/rootfs.cpio) root=/dev/ram0 panic=1 pci=off nomodules console=ttyS0 i8042.noaux i8042.nomux i8042.nopnp i8042.dumbkbd nit.target=/nautilus-app"
 
 FROM scratch AS package
 COPY --from=build /nitro.eif .

@@ -2,7 +2,7 @@ OUT_DIR ?= out
 ENCLAVE_CID ?= 16
 ENCLAVE_CPUS ?= 4
 ENCLAVE_MEMORY ?= 6144M
-EIF_INPUTS := Cargo.toml Cargo.lock rust-toolchain.toml Containerfile.eif .dockerignore $(shell find crates eif scripts -type f -not -path '*/target/*')
+EIF_INPUTS := Cargo.toml Cargo.lock rust-toolchain.toml Containerfile.eif .dockerignore $(shell find crates scripts -type f -not -path '*/target/*')
 
 .DEFAULT_GOAL := eif
 
