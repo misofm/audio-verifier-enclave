@@ -26,7 +26,8 @@ pub use audio_verifier::MAX_DECODED_BYTES;
 /// Deadline for one `/process_data` upload and measurement.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// Deadline for a `/process_data` upload alone: 256 MiB needs about 3 MB/s, leaving at least 30 s to measure.
+/// Deadline for a `/process_data` upload alone: 256 MiB needs about 3 MB/s, leaving at least
+/// 30 s to measure.
 pub const BODY_READ_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// Open connections, matching the host bridge's 256. Idle ones cost little, because the single
@@ -47,7 +48,7 @@ pub const MEASURE_MAX_CONCURRENT: usize = 2;
 /// A `/v1/measure` body that delivers nothing for this long is abandoned.
 pub const MEASURE_CHUNK_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Deadline for one `/v1/measure` request, body and measurement: 256 MiB at 1 MB/s.
+/// Deadline for one `/v1/measure` request, body and measurement: 256 MiB at about 0.5 MB/s.
 pub const MEASURE_REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Environment variable that overrides the body limit.
