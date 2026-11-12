@@ -1,7 +1,9 @@
 use std::path::Path;
 
 use audio_verifier::AudioPayload;
-use audio_verifier_enclave::{AUDIO_INTENT, AudioJson, ProcessDataResponse, response};
+use audio_verifier_enclave::{
+    AUDIO_INTENT, AudioJson, MASTER_FILE_INTENT, MasterFilePayload, ProcessDataResponse, response,
+};
 use nautilus::{
     EnclaveIdentity, Intent, NautilusContext, intent_message, testing::FakeAttestor,
     verify_signed_response,
@@ -32,6 +34,25 @@ fn fixed_audio() -> AudioPayload {
         samples_per_channel: 480_000,
         pcm_digest: vec![0x11; 32],
     }
+}
+
+const FILE_SIZE: u64 = 285_050_717;
+
+fn fixed_master_file() -> MasterFilePayload {
+    MasterFilePayload {
+        audio: fixed_audio(),
+        file_size: FILE_SIZE,
+        file_sha256: vec![0x22; 32],
+    }
+}
+
+/// A `MasterFilePayload` as JSON: the audio facts as in `audio_intent.json`, and the file's
+/// size and SHA-256 as in the `/v1/measure` response's `master_file`.
+#[derive(Serialize)]
+struct MasterFileFields {
+    audio: AudioJson,
+    file_size: String,
+    file_sha256: String,
 }
 
 fn context() -> NautilusContext {
@@ -89,6 +110,30 @@ fn audio_vector() -> (Vector<AudioJson>, NautilusContext) {
     (audio, ctx)
 }
 
+fn master_file_vector() -> (Vector<MasterFileFields>, NautilusContext) {
+    let ctx = context();
+    let signed = ctx
+        .sign_intent_at(MASTER_FILE_INTENT, TIMESTAMP_MS, fixed_master_file())
+        .expect("sign");
+    verify_signed_response(&ctx.public_key(), MASTER_FILE_INTENT, &signed)
+        .expect("file binding verifies");
+    let payload = signed.response.data;
+    let fields = MasterFileFields {
+        audio: AudioJson::from(&payload.audio),
+        file_size: payload.file_size.to_string(),
+        file_sha256: hex::encode(&payload.file_sha256),
+    };
+    let vector = vector(
+        &ctx,
+        MASTER_FILE_INTENT,
+        AUDIO_INTENT,
+        payload,
+        signed.signature,
+        fields,
+    );
+    (vector, ctx)
+}
+
 fn facts_bcs() -> Vec<u8> {
     let mut expected = vec![2, 24];
     expected.extend(48_000u32.to_le_bytes());
@@ -103,6 +148,19 @@ fn audio_payload_bcs_matches_move_layout() {
     let payload = bcs::to_bytes(&fixed_audio()).expect("BCS");
     assert_eq!(payload, facts_bcs());
     assert_eq!(payload.len(), 1 + 1 + 4 + 8 + 33);
+}
+
+#[test]
+fn master_file_payload_bcs_nests_the_audio_payload() {
+    let payload = bcs::to_bytes(&fixed_master_file()).expect("BCS");
+    let mut expected = facts_bcs();
+    expected.extend(FILE_SIZE.to_le_bytes());
+    expected.push(32);
+    expected.extend([0x22; 32]);
+    assert_eq!(payload, expected);
+    assert_eq!(payload.len(), 47 + 8 + 33);
+    let message = intent_message(MASTER_FILE_INTENT, TIMESTAMP_MS, &fixed_master_file());
+    assert_eq!(message.expect("BCS").len(), 1 + 8 + 88);
 }
 
 fn assert_signs<T>(vector: &Vector<T>, ctx: &NautilusContext, intent: Intent) {
@@ -135,6 +193,8 @@ fn assert_signs<T>(vector: &Vector<T>, ctx: &NautilusContext, intent: Intent) {
 fn vector_signature_verifies_under_its_intent_only() {
     let (audio, ctx) = audio_vector();
     assert_signs(&audio, &ctx, AUDIO_INTENT);
+    let (master_file, ctx) = master_file_vector();
+    assert_signs(&master_file, &ctx, MASTER_FILE_INTENT);
 }
 
 fn assert_committed<T: Serialize>(name: &str, vector: &T) {
@@ -153,4 +213,10 @@ fn assert_committed<T: Serialize>(name: &str, vector: &T) {
 fn committed_vector_is_up_to_date() {
     let (audio, _) = audio_vector();
     assert_committed("audio_intent.json", &audio);
+}
+
+#[test]
+fn committed_master_file_vector_is_up_to_date() {
+    let (master_file, _) = master_file_vector();
+    assert_committed("master_file_intent.json", &master_file);
 }
