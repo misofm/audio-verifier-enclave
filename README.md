@@ -101,7 +101,25 @@ make eif
 make run-eif
 ```
 
-The image is written to `out/nitro.eif`, with its PCRs in `out/nitro.pcrs`. The default allocation is four vCPUs and 6144 MiB (`ENCLAVE_CPUS`, `ENCLAVE_MEMORY`). Bridge clients to vsock port 3000 through the parent instance, and register the image's PCRs through the Move enclave policy before using its signatures on-chain. A new version is a new image with new PCRs, so routes are not versioned.
+The image is written to `out/nitro.eif`, with its PCRs in `out/nitro.pcrs`. The default allocation is four vCPUs and 6144 MiB (`ENCLAVE_CPUS`, `ENCLAVE_MEMORY`). Register the image's PCRs through the Move enclave policy before using its signatures on-chain. A new version is a new image with new PCRs, so routes are not versioned.
+
+### Parent instance
+
+`host/` sets up an Amazon Linux 2023 parent with enclaves enabled. As root, from a checkout:
+
+```sh
+host/setup.sh out/nitro.eif 4 6144
+systemctl start audio-verifier-enclave argonaut
+```
+
+| Unit | What it runs |
+|---|---|
+| `audio-verifier-enclave` | `nitro-cli run-enclave` on `/opt/miso/audio-verifier.eif`, CID 16, at boot; vCPUs and memory from `/etc/miso/audio-verifier.env` |
+| `argonaut` | [argonaut](https://github.com/miraicloud/argonaut), pinned by commit in `setup.sh`: TCP `127.0.0.1:3000` to the enclave's vsock port 3000, at most 256 connections |
+
+- The service listens only on loopback; whatever exposes it beyond the instance must authenticate its callers.
+- Every enclave start, including a reboot or a spot stop and start, creates a new signing key. Register it with a fresh `/attest` document before its signatures verify.
+- The vCPU count must be even on instances with SMT, and the allocator reservation in `/etc/nitro_enclaves/allocator.yaml` is written to match.
 
 ### Sizing
 

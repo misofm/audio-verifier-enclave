@@ -1,0 +1,14 @@
+[Unit]
+Description=Audio verifier Nitro enclave
+After=nitro-enclaves-allocator.service
+Requires=nitro-enclaves-allocator.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+EnvironmentFile=/etc/miso/audio-verifier.env
+ExecStart=/usr/bin/nitro-cli run-enclave --cpu-count ${ENCLAVE_CPUS} --memory ${ENCLAVE_MEMORY_MIB} --enclave-cid 16 --eif-path /opt/miso/audio-verifier.eif
+ExecStop=/usr/bin/nitro-cli terminate-enclave --all
+
+[Install]
+WantedBy=multi-user.target
