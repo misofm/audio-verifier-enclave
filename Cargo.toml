@@ -1,5 +1,6 @@
 [workspace]
 members = ["crates/libflac", "crates/audio-verifier", "crates/audio-verifier-enclave"]
+exclude = ["host/gateway"]
 resolver = "3"
 
 [workspace.package]

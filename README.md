@@ -109,15 +109,21 @@ The image is written to `out/nitro.eif`, with its PCRs in `out/nitro.pcrs`. The 
 
 ```sh
 host/setup.sh out/nitro.eif 4 6144
-systemctl start audio-verifier-enclave argonaut
+systemctl start audio-verifier-enclave argonaut audio-verifier-host
 ```
 
 | Unit | What it runs |
 |---|---|
 | `audio-verifier-enclave` | `nitro-cli run-enclave` on `/opt/miso/audio-verifier.eif`, CID 16, at boot; vCPUs and memory from `/etc/miso/audio-verifier.env` |
 | `argonaut` | [argonaut](https://github.com/miraicloud/argonaut), pinned by commit in `setup.sh`: TCP `127.0.0.1:3000` to the enclave's vsock port 3000, at most 256 connections |
+| `audio-verifier-host` | the gateway in [`host/gateway`](host/gateway), built by `setup.sh` with rustup's Rust: HTTP on `127.0.0.1:4000`, the only service callers reach |
 
-- The service listens only on loopback; whatever exposes it beyond the instance must authenticate its callers.
+- Every service listens only on loopback; whatever exposes the gateway beyond the instance, such as a Cloudflare Tunnel, must authenticate its callers.
+- The gateway keeps no state and no queue. `POST /measure` takes `{ "url": "<presigned R2 GET URL>" }`, downloads the file and streams it into the enclave's `/measure` with the download's `Content-Length`, and returns the enclave's status and JSON unchanged; callers retry on 429 and 5xx. `POST /attest` (body at most 4 KiB) and `GET /health` pass through; other routes and methods get 404 `not_found`.
+- It sends the enclave request as soon as the download's headers arrive, so an enclave 429 `overloaded` returns at once and the download is dropped. A download without `Content-Length` gets 502 `download_failed`, one over 256 MiB 413 `body_too_large`, before any body is read. A download that fails, redirects, answers other than 2xx, or delivers other than `Content-Length` bytes gets 502 `download_failed`; an unreachable enclave 502 `enclave_unavailable`.
+- Download URLs must be `https` on port 443, without credentials, with a host name ending in `.r2.cloudflarestorage.com` (`<account-id>.r2…` or `<account-id>.<jurisdiction>.r2…`); others get 400 `url_not_allowed`. Redirects are not followed and proxies not used. Names resolve only to public addresses: loopback, private, link-local (the `169.254.169.254` metadata service), shared, multicast and reserved ranges are refused, and the connection uses the checked addresses. `--allowed-host-suffix` (repeatable) replaces the suffix.
+- At most 16 `/measure` requests at once (`--max-in-flight`), more get 429 `overloaded`; files are streamed, never buffered. Timeouts: 10 s to connect (`--connect-timeout-secs`), 20 s without download data (`--idle-timeout-secs`), and 630 s for a whole `/measure` (`--request-timeout-secs`; the enclave allows 600 s), after which it gets 504 `request_timeout`.
+- The gateway is its own Cargo workspace with its own `Cargo.lock`, excluded from the root workspace: it changes neither the enclave's `Cargo.lock`, its vendored dependencies, nor its binary.
 - Every enclave start, including a reboot or a spot stop and start, creates a new signing key. Register it with a fresh `/attest` document before its signatures verify.
 - The vCPU count must be even on instances with SMT, and the allocator reservation in `/etc/nitro_enclaves/allocator.yaml` is written to match.
 
@@ -139,6 +145,7 @@ jobs = max(1, min(vCPUs, (MemTotal - 128 MiB) / 48 MiB))
 
 ```sh
 cargo test --locked --workspace
+(cd host/gateway && cargo test --locked)
 ```
 
 Every measurement case also runs in chunks of 1, 7, 4096 and 1 MiB bytes and must reach the same verdict, error included. A differential fuzz (`crates/audio-verifier/tests/differential.rs`, fixed seed) mutates seven files 150 times each and requires the same result from several chunkings of each; set `FUZZ_ITERATIONS` for a longer run. Installing `ffmpeg` enables cross-checks against an independent decoder. The Move package's tests live with it in `misofm/framework`.

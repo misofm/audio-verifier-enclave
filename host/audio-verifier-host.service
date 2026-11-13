@@ -1,0 +1,13 @@
+[Unit]
+Description=audio-verifier-host: HTTP gateway on 127.0.0.1:4000 to the enclave
+After=network-online.target argonaut.service
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/audio-verifier-host
+Restart=always
+RestartSec=2
+DynamicUser=yes
+
+[Install]
+WantedBy=multi-user.target
