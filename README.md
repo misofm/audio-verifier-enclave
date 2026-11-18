@@ -1,6 +1,6 @@
 # Nautilus Audio Verifier
 
-Measures and encrypts FLAC masters inside a Nautilus enclave on AWS Nitro, and verifies the signed results on Sui. It decodes and checks the file, reads its channel layout, encrypts the whole file under a fresh key (the DEK), computes the Walrus blob ID of the ciphertext, and Seal-encrypts the DEK so that only the Recording's owner can get it back. It signs the audio's channels, bit depth, sample rate, sample count, BLAKE3 PCM digest and channel layout with the blob ID and the sealed DEK, and separately the size and SHA-256 of the file it measured, for off-chain verifiers. The DEK never leaves the enclave unsealed.
+Measures and encrypts FLAC masters inside a Nautilus enclave on AWS Nitro, and verifies the signed results on Sui. A browser uploads the file encrypted to the enclave (HPKE, to a key made inside it), so its host and everything in front of it carry only ciphertext. The enclave decodes and checks the file, reads its channel layout, encrypts the whole file under a fresh key (the DEK), computes the Walrus blob ID of the ciphertext, and Seal-encrypts the DEK so that only the Recording's owner can get it back. It signs the audio's channels, bit depth, sample rate, sample count, BLAKE3 PCM digest and channel layout with the blob ID and the sealed DEK, and separately the size and SHA-256 of the file it measured, for off-chain verifiers. The DEK never leaves the enclave unsealed.
 
 The [`audio_verifier`](https://github.com/misofm/framework/tree/main/audio_verifier) Move package, in `misofm/framework`, verifies the signature and returns an `Audio<AudioVerifier, Pcm, ChannelLayout>` whose data is the encrypted Walrus blob, which `recording_master` stores on the Recording. `recording_master_seal` is the Seal policy that releases the DEK to the holder of that Recording's admin cap. This verifies technical properties of the audio; it does not establish authorship or ownership.
 
@@ -43,6 +43,8 @@ The service serves HTTP on vsock port 3000. Errors are JSON `{ "error": code, "m
 
 | Route | Body | Response |
 |---|---|---|
+| `GET /upload-key` | | the enclave's X25519 upload key, signed (intent 3, see [The encrypted upload](#the-encrypted-upload)) |
+| `POST /upload` | the file encrypted to the upload key, as records (see [The encrypted upload](#the-encrypted-upload)) | as `/measure` |
 | `POST /measure?recording_id=<hex>` | the FLAC file, streamed, with `Content-Length` | `application/vnd.miso.measured-master`: the JSON below, a newline (`0x0a`), then the ciphertext |
 | `POST /attest` | `{ "nonce": hex }` | `{ "attestation": hex }`, the NSM document binding `public_key` |
 | `GET /health` | | `{ "pk", "address" }` |
@@ -89,6 +91,26 @@ The service serves HTTP on vsock port 3000. Errors are JSON `{ "error": code, "m
 
 Unknown routes get 404 `not_found`, other methods 405 `method_not_allowed`. The service closes connections beyond 256, connections whose request headers take more than 10 s, and idle connections after 30 s.
 
+## The encrypted upload
+
+`/upload` takes the file encrypted to the enclave, so the plaintext exists only in the browser and inside the enclave. It is decrypted frame by frame into `/measure`'s pipeline and is never written anywhere; the answer is `/measure`'s, the same facts, ciphertext and signatures as for the same file sent in the clear.
+
+| | |
+|---|---|
+| Upload key | X25519, made at boot from 32 bytes of the kernel's randomness (`DeriveKeyPair`), held only in the enclave's memory; a new one at every start, as the Ed25519 key |
+| `GET /upload-key` | `{ intent: 3, timestamp_ms, context: "miso-master-upload-v1", x25519_public_key, expires_ms, signature, public_key }`: the public key signed with the Ed25519 key, offered until `expires_ms`, 10 minutes after signing (`UPLOAD_KEY_LIFETIME_MS`) |
+| HPKE | RFC 9180 base mode: DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, AES-256-GCM (`hpke` 0.13) |
+| `info` | `"miso-master-upload-v1" ‖ policy ‖ recording_id ‖ u64be(file_size) ‖ u64be(key_expires_ms)`, 101 bytes; `policy` is the testnet `EnclavePolicy<AUDIO_VERIFIER>` `0xeb9fdb27…160e` (`AUDIO_VERIFIER_POLICY`), pinned in the image |
+| Frames | `u64be(offset) ‖ seal(chunk)`, 1 to 1,048,576 bytes of the file each (`MAX_FRAME_PLAINTEXT`), in order from offset 0; the nonces are HPKE's sequence numbers and the associated data `u64be(offset) ‖ last`, `last` 1 on the frame that ends the file, else 0 |
+
+A client checks the key before encrypting to it: the signature, under `public_key`, over `bcs(IntentMessage { intent: 3, timestamp_ms, data: UploadKeyPayload { context: vector<u8>, x25519_public_key: vector<u8>, expires_ms: u64 } })`; that `expires_ms` has not passed; and that `public_key` is registered at the current version of the on-chain policy, so it belongs to an enclave whose attestation matched the policy's PCRs (`AudioVerifier.uploadKey` in `@misofm/sdk`). The browser parses no attestation.
+
+`/upload`'s body is records, each `u32be(length) ‖ bytes`, without `Content-Length` (chunked): first the start record, JSON `{ "enc", "recording_id", "file_size", "key_expires_ms" }` (the encapsulated key as hex, the rest as `/measure` takes them, the u64s as decimal strings) of at most 4 KiB, then one record per frame. The enclave builds `info` from the start record, so a start that names another recording, size or expiry than the client encrypted for does not open. A frame is refused (400 `upload_rejected`, and no signature) if it is not at the next offset, runs past `file_size`, is empty or over 1 MiB, or does not open; that covers a reordered, dropped, repeated, altered or moved frame, one marked last too early or too late, and another key. The body must end with the frame that reaches `file_size`, and nothing may follow it. A key whose `key_expires_ms` has passed is 400 `upload_key_expired`; one later than any this enclave signs, 400 `upload_rejected`. A refused body is still read, and thrown away, for up to 30 s after the answer, so a client still sending it gets the answer rather than a reset connection. Otherwise `/upload` answers and limits as `/measure`: it takes one of the same jobs, the decoder's refusals are 422, and its deadlines are the same.
+
+An upload is not resumed. The measurement, the encryption under the DEK and the file's SHA-256 are one pass over the plaintext, held in one request; resuming would keep a half-measured job, up to 512 MiB of it, for a client that may not return, or move its state out of the enclave. A broken upload starts again from offset 0 with a fresh `/upload-key` and a fresh HPKE context, which costs at most the bytes already sent. The host's acknowledgements say how far it got.
+
+[`vectors/upload_key_intent.json`](vectors/upload_key_intent.json) holds a signed upload key from the seed `[7; 32]`, and [`vectors/upload_hpke.json`](vectors/upload_hpke.json) an upload sealed from fixed key material, which `@hpke/core`, the browser's HPKE, reproduces byte for byte; the boot self-test opens it.
+
 ## The encrypted master
 
 | | |
@@ -100,7 +122,7 @@ Unknown routes get 404 `not_found`, other methods 405 `method_not_allowed`. The 
 | Policy | `recording_master_seal` `0xf2452914718b6f8d3cadef6e04d390fb66b496e7e5095de67b254eecbd77b6fb` |
 | Identity | `bcs(recording_id: address) ‖ bcs(blob_id: u256)`, 64 bytes: the Recording's object ID, then the blob ID's 32 bytes, which are Walrus's raw blob ID bytes and the little-endian `u256` |
 
-The pins are constants in [`crates/audio-verifier-enclave/src/master.rs`](crates/audio-verifier-enclave/src/master.rs), so they are part of the image and its PCRs; changing one is a new image, registered again. At boot the service checks the decoder, a Tink known answer and a Walrus blob ID against recorded answers, and parses the pinned key, and refuses to start if any fails.
+The pins are constants in [`crates/audio-verifier-enclave/src/master.rs`](crates/audio-verifier-enclave/src/master.rs), so they are part of the image and its PCRs; changing one is a new image, registered again. At boot the service checks the decoder, a Tink known answer, an HPKE upload and a Walrus blob ID against recorded answers, and parses the pinned key, and refuses to start if any fails.
 
 The ciphertext is app-v2's `src/posts/tink.ts` format with 1 MiB segments in place of 64 KiB ones: its header (one length byte, 40, a 32-byte salt and a 7-byte nonce prefix), its key derivation and its per-segment nonces (`prefix ‖ u32be(index) ‖ last`) are the same. A browser decrypts it with that file once its `SEGMENT_BYTES` is a parameter. [`interop/`](interop) proves both directions of agreement with outside code (see [Test](#test)).
 
@@ -126,6 +148,13 @@ intent 2, verified off chain:
     file_size: u64,              // bytes of the file as received
     file_sha256: vector<u8>,     // 32 bytes, SHA-256 of those bytes
   }
+
+intent 3, the upload key, verified off chain by the client that encrypts to it:
+  UploadKeyPayload {
+    context: vector<u8>,             // "miso-master-upload-v1"
+    x25519_public_key: vector<u8>,   // 32 bytes
+    expires_ms: u64,
+  }
 ```
 
 Integers are little-endian, `u256` is 32 bytes with no length prefix, and each `vector<u8>` is prefixed with its ULEB128 length. A `blob_id` of Walrus's raw bytes `b` is the `u256` whose BCS is `b`. `pcm_digest` hashes the PCM interleaved by sample frame, each sample signed little-endian in `ceil(bit_depth / 8)` bytes. Intent 1 was a retired payload and is not reused.
@@ -136,7 +165,7 @@ No Move package consumes intent 2. An off-chain verifier rebuilds `MasterFilePay
 
 ## Use on Sui
 
-Publish the [`audio_verifier` Move package](https://github.com/misofm/framework/tree/main/audio_verifier), configure its enclave policy, and register an attested enclave. Store the ciphertext on Walrus (the gateway does), then pass `audio`'s fields, `blob_id_u256` as the `blob_id`, the timestamp and the signature to `audio_verifier::audio_verifier::verify_audio(policy, channels, bit_depth, sample_rate_hz, samples_per_channel, pcm_digest, channel_layout, blob_id, sealed_dek, pk, timestamp_ms, signature)`, and attach the returned `Audio` to the Recording with `recording_master::add_master` in the same transaction. See its [README](https://github.com/misofm/framework/tree/main/audio_verifier) for the API and policy setup. On testnet, `audio_verifier` is `0x79cb3c048707800ea6219cf5f86ef22993837ccb912bba81035abc337e5454c0` and its `EnclavePolicy` `0xeb9fdb274f4edbda86b322cbb876a4f92aa6b9e58964d6d5953ff0cead49160e`.
+Publish the [`audio_verifier` Move package](https://github.com/misofm/framework/tree/main/audio_verifier), configure its enclave policy, and register an attested enclave. Store the ciphertext on Walrus (Miso's API does, from R2, checking the blob ID), then pass `audio`'s fields, `blob_id_u256` as the `blob_id`, the timestamp and the signature to `audio_verifier::audio_verifier::verify_audio(policy, channels, bit_depth, sample_rate_hz, samples_per_channel, pcm_digest, channel_layout, blob_id, sealed_dek, pk, timestamp_ms, signature)`, and attach the returned `Audio` to the Recording with `recording_master::add_master` in the same transaction. See its [README](https://github.com/misofm/framework/tree/main/audio_verifier) for the API and policy setup. On testnet, `audio_verifier` is `0x79cb3c048707800ea6219cf5f86ef22993837ccb912bba81035abc337e5454c0` and its `EnclavePolicy` `0xeb9fdb274f4edbda86b322cbb876a4f92aa6b9e58964d6d5953ff0cead49160e`.
 
 ## Run in an enclave
 
@@ -165,7 +194,13 @@ systemctl start audio-verifier-enclave argonaut audio-verifier-host
 | `audio-verifier-host` | the gateway in [`host/gateway`](host/gateway), built by `setup.sh` with rustup's Rust: HTTP on `127.0.0.1:4000`, the only service callers reach |
 
 - Every service listens only on loopback; whatever exposes the gateway beyond the instance, such as a Cloudflare Tunnel, must authenticate its callers.
-- The gateway keeps no state and no queue. `POST /measure` takes `{ "url": "<presigned R2 GET URL>", "recording_id": "<hex object ID>" }`, downloads the file and streams it into the enclave's `/measure` with the download's `Content-Length`. An enclave error returns unchanged; callers retry on 429 and 5xx. A measured master's ciphertext is streamed, as it arrives, to the Walrus publisher (`PUT /v1/blobs?epochs=<n>&permanent=true`), and the caller gets the enclave's JSON with `walrus`, the publisher's answer, added, once Walrus's blob ID (`newlyCreated.blobObject.blobId` or `alreadyCertified.blobId`) is the one the enclave signed. Another blob ID gets 502 `blob_id_mismatch`, a failed upload 502 `upload_failed`. `POST /attest` (body at most 4 KiB) and `GET /health` pass through; other routes and methods get 404 `not_found`.
+- The gateway keeps no state and no queue. `GET /upload` is a WebSocket for the encrypted upload. Its caller, Miso's API Worker through a Workers VPC service, checks who uploads and names the upload in the upgrade's headers: `x-miso-recording-id`, `x-miso-file-size` (at most 256 MiB) and `x-miso-upload-url`, a presigned R2 `PUT` for the ciphertext, held to the download URL rules below (400 `invalid_request` or `url_not_allowed`, before the upgrade). Then:
+  1. the gateway sends `{ "type": "upload_key", "key": <the enclave's /upload-key> }`;
+  2. the client sends `{ "type": "start", "enc", "recording_id", "file_size", "key_expires_ms" }`, whose recording and size must be the headers', within 60 s;
+  3. the client sends the frames as binary messages (at most 1 MiB + 24 bytes each), and the gateway, which sees each frame's offset but not its contents, checks that each starts where the last ended and forwards it to the enclave's `/upload` as a record, then answers `{ "type": "ack", "received": <bytes of the file through it> }` once the enclave's request has taken it (at most four records queued); a client that sends nothing for 60 s is cut off;
+  4. once the enclave has answered, the gateway streams the ciphertext to the presigned URL with its `Content-Length` and sends `{ "type": "done", "measured": <the enclave's JSON> }`; or, at any point, `{ "type": "error", "error", "message" }`, an enclave refusal's code and message unchanged. Then it closes.
+  The gateway never sees the plaintext or a key, and stores nothing on Walrus for uploads: the API moves the ciphertext from R2 to Walrus and checks its blob ID. Uploads count against `--max-in-flight` with `/measure`, and the whole session has the request and upload timeouts together.
+- `POST /measure`, for masters uploaded in the clear before the encrypted upload, takes `{ "url": "<presigned R2 GET URL>", "recording_id": "<hex object ID>" }`, downloads the file and streams it into the enclave's `/measure` with the download's `Content-Length`. An enclave error returns unchanged; callers retry on 429 and 5xx. A measured master's ciphertext is streamed, as it arrives, to the Walrus publisher (`PUT /v1/blobs?epochs=<n>&permanent=true`), and the caller gets the enclave's JSON with `walrus`, the publisher's answer, added, once Walrus's blob ID (`newlyCreated.blobObject.blobId` or `alreadyCertified.blobId`) is the one the enclave signed. Another blob ID gets 502 `blob_id_mismatch`, a failed upload 502 `upload_failed`. `POST /attest` (body at most 4 KiB) and `GET /health` pass through; other routes and methods get 404 `not_found`.
 - The publisher is `https://publisher.walrus-testnet.walrus.space` unless `--walrus-publisher` names another, storing for 53 epochs (`--walrus-epochs`); `--walrus-send-object-to` sends the `Blob` objects to an address of yours rather than the publisher's. Publishers on the public internet do not authenticate; run your own, funded, for production.
 - It sends the enclave request as soon as the download's headers arrive, so an enclave 429 `overloaded` returns at once and the download is dropped. A download without `Content-Length` gets 502 `download_failed`, one over 256 MiB 413 `body_too_large`, before any body is read. A download that fails, redirects, answers other than 2xx, or delivers other than `Content-Length` bytes gets 502 `download_failed`; an unreachable enclave 502 `enclave_unavailable`.
 - Download URLs must be `https` on port 443, without credentials, with a host name ending in `.r2.cloudflarestorage.com` (`<account-id>.r2…` or `<account-id>.<jurisdiction>.r2…`); others get 400 `url_not_allowed`. Redirects are not followed and proxies not used. Names resolve only to public addresses: loopback, private, link-local (the `169.254.169.254` metadata service), shared, multicast and reserved ranges are refused, and the connection uses the checked addresses. `--allowed-host-suffix` (repeatable) replaces the suffix.
@@ -205,7 +240,9 @@ node interop/check.mjs <app-v2> interop/out <flac> <recording-id>
 python3 interop/tink_check.py interop/out <flac>
 ```
 
-The first writes a Tink known answer and `/measure`'s output, with the image's pins and with a key server key of its own, whose DEK it opens. `check.mjs` decrypts both ciphertexts with app-v2's `tink.ts` at 1 MiB segments, whole and streamed; parses the sealed DEK with `@mysten/seal` and checks its package, identity, key server and threshold; loads the key server from testnet through `@mysten/seal` and checks its public key is the pinned one; and has `@mysten/seal` encrypt to the same identity, for an object of the same shape and size. `tink_check.py` decrypts both with Google's Tink, keys built from the raw DEK and the `AES256_GCM_HKDF_1MB` template's parameters. The Walrus blob ID is checked against the CLI's answers for three fixtures in the unit tests and at boot, and against Walrus itself by the gateway on every upload.
+The first writes a Tink known answer and `/measure`'s output, with the image's pins and with a key server key of its own, whose DEK it opens. `check.mjs` decrypts both ciphertexts with app-v2's `tink.ts` at 1 MiB segments, whole and streamed; parses the sealed DEK with `@mysten/seal` and checks its package, identity, key server and threshold; loads the key server from testnet through `@mysten/seal` and checks its public key is the pinned one; and has `@mysten/seal` encrypt to the same identity, for an object of the same shape and size. `tink_check.py` decrypts both with Google's Tink, keys built from the raw DEK and the `AES256_GCM_HKDF_1MB` template's parameters. The Walrus blob ID is checked against the CLI's answers for three fixtures in the unit tests and at boot, and against Walrus itself whenever a ciphertext is stored: by Miso's API for encrypted uploads, by the gateway for `/measure`.
+
+`interop/upload.mjs` runs the encrypted upload with `@misofm/sdk`'s code against the dev server below: it checks the signed key, seals a FLAC file in 1 MiB frames, compares the signed SHA-256 with the file's, and requires reordered, dropped, altered and truncated frames, another recording in the start, another key and an expired key each to be refused (`node interop/upload.mjs <sdk checkout, built> <flac>`).
 
 `cargo run --release -p audio-verifier-enclave --example dev_server` serves the routes on TCP `127.0.0.1:3000` with a fixed test identity, for running the gateway locally. A differential fuzz (`crates/audio-verifier/tests/differential.rs`, fixed seed) mutates seven files 150 times each and requires the same result from several chunkings of each; set `FUZZ_ITERATIONS` for a longer run. Installing `ffmpeg` enables cross-checks against an independent decoder. The Move package's tests live with it in `misofm/framework`.
 

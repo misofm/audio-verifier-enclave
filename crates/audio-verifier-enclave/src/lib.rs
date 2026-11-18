@@ -1,9 +1,11 @@
-//! The service's router: `POST /measure`, `POST /attest` and `GET /health`. Nautilus's own
+//! The service's router: `POST /measure`, `GET /upload-key`, `POST /upload`, `POST /attest` and
+//! `GET /health`. Nautilus's own
 //! router is not used: it always mounts `/process_data`, and it buffers bodies whole.
 
 pub mod master;
 mod measure;
 pub mod tink;
+pub mod upload;
 
 use std::{sync::Arc, time::Duration};
 
@@ -26,6 +28,7 @@ use walrus_core::BlobId;
 
 pub use master::{Pins, identity, u256_le_decimal};
 pub use measure::MEASURED_MASTER_TYPE;
+pub use upload::{UPLOAD_KEY_INTENT, UploadKey};
 
 /// Intent of the signed `IntentMessage<AudioPayload>`, verified on chain by
 /// `audio_verifier::verify_audio`.
@@ -94,11 +97,13 @@ impl Limits {
     }
 }
 
-/// Checks the decoder, the Tink encryption, the Walrus blob ID and the pinned Seal key against
-/// recorded answers, so that a build that computes wrongly on this CPU refuses to start.
+/// Checks the decoder, the Tink encryption, the HPKE upload, the Walrus blob ID and the pinned
+/// Seal key against recorded answers, so that a build that computes wrongly on this CPU refuses
+/// to start.
 pub fn self_test() -> Result<(), String> {
     audio_verifier::self_test().map_err(|error| error.to_string())?;
     tink::self_test()?;
+    upload::self_test()?;
     let pins = Pins::pinned();
     let (name, bytes, expected) = master::KNOWN_BLOB_IDS[0];
     if pins.blob_id(bytes)?.to_string() != expected {
@@ -298,22 +303,29 @@ pub fn sign_measurement(
 struct Service {
     ctx: NautilusContext,
     pins: Arc<Pins>,
+    upload_key: UploadKey,
     limits: Limits,
     measure_permits: Arc<Semaphore>,
     attest_permit: Arc<Semaphore>,
 }
 
-/// Builds the service's router around an injected context, with the image's [`Pins`].
-/// `/attest` runs one at a time.
+/// Builds the service's router around an injected context, with the image's [`Pins`] and a
+/// fresh upload key. `/attest` runs one at a time; `/measure` and `/upload` share the jobs.
 pub fn app(ctx: NautilusContext, limits: Limits) -> Router {
-    app_with_pins(ctx, limits, Pins::pinned())
+    app_with(ctx, limits, Pins::pinned(), UploadKey::generate())
 }
 
 /// [`app`] with other pins, for tests.
 pub fn app_with_pins(ctx: NautilusContext, limits: Limits, pins: Pins) -> Router {
+    app_with(ctx, limits, pins, UploadKey::generate())
+}
+
+/// [`app`] with other pins and a given upload key, for tests.
+pub fn app_with(ctx: NautilusContext, limits: Limits, pins: Pins, upload_key: UploadKey) -> Router {
     let service = Service {
         ctx,
         pins: Arc::new(pins),
+        upload_key,
         limits,
         measure_permits: Arc::new(Semaphore::new(limits.jobs)),
         attest_permit: Arc::new(Semaphore::new(1)),
@@ -322,6 +334,8 @@ pub fn app_with_pins(ctx: NautilusContext, limits: Limits, pins: Pins) -> Router
         .route("/health", get(health))
         .route("/attest", post(attest))
         .route("/measure", post(measure::measure))
+        .route("/upload-key", get(upload::upload_key))
+        .route("/upload", post(upload::upload))
         .with_state(Arc::new(service))
         .method_not_allowed_fallback(|| async {
             refuse(ErrorCode::MethodNotAllowed, "method not allowed")

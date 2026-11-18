@@ -17,10 +17,13 @@ audio-verifier = { path = "crates/audio-verifier" }
 axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "tokio"] }
 bcs = "0.1.6"
 blake3 = "1.8.2"
+bytes = "1.11.1"
 cc = "1.2.62"
 futures-util = "0.3.31"
 hex = "0.4.3"
 hkdf = "0.12.4"
+# HPKE (RFC 9180) for the encrypted upload: DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, AES-256-GCM.
+hpke = { version = "0.13.0", default-features = false, features = ["alloc", "x25519"] }
 libflac = { path = "crates/libflac" }
 md-5 = "0.10.6"
 # fastcrypto at the revision seal-crypto pins, for its BLS12-381 public key type.

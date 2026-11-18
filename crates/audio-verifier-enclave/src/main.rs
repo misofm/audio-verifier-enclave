@@ -1,6 +1,8 @@
 use std::{error::Error, fs, num::NonZeroUsize, thread, time::Duration};
 
-use audio_verifier_enclave::{Limits, app, measure_jobs, mem_total, self_test};
+use audio_verifier_enclave::{
+    Limits, Pins, UploadKey, app_with, measure_jobs, mem_total, self_test,
+};
 use nautilus::{NautilusContext, ServerConfig};
 
 const VSOCK_PORT: u32 = 3000;
@@ -15,7 +17,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .as_deref()
         .and_then(mem_total);
     let jobs = measure_jobs(cpus, memory);
+    let upload_key = UploadKey::generate();
     println!("[server] public key: {}", ctx.public_key_hex());
+    println!(
+        "[server] upload key: {}",
+        hex::encode(upload_key.public_key())
+    );
     println!(
         "[server] /measure jobs: {jobs} ({cpus} vCPUs, MemTotal {} MiB)",
         memory.map_or_else(|| "unknown".into(), |bytes| (bytes >> 20).to_string())
@@ -29,6 +36,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         ..ServerConfig::default()
     };
     println!("[server] listening on vsock port {VSOCK_PORT}");
-    nautilus::serve_vsock(VSOCK_PORT, app(ctx, Limits::new(jobs)), config).await?;
+    let app = app_with(ctx, Limits::new(jobs), Pins::pinned(), upload_key);
+    nautilus::serve_vsock(VSOCK_PORT, app, config).await?;
     Ok(())
 }

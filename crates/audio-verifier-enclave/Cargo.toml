@@ -13,10 +13,12 @@ aes-gcm.workspace = true
 audio-verifier.workspace = true
 axum.workspace = true
 bcs.workspace = true
+bytes.workspace = true
 fastcrypto.workspace = true
 futures-util.workspace = true
 hex.workspace = true
 hkdf.workspace = true
+hpke.workspace = true
 nautilus = { workspace = true, features = ["vsock"] }
 rand.workspace = true
 seal-crypto.workspace = true
@@ -28,6 +30,8 @@ walrus-core.workspace = true
 
 [dev-dependencies]
 nautilus = { workspace = true, features = ["test-utils"] }
+# The RNG traits hpke 0.13 takes, for the tests' HPKE sender.
+rand_core_09 = { package = "rand_core", version = "0.9.5" }
 tower.workspace = true
 
 [lints]

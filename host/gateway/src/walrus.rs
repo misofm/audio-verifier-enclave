@@ -3,7 +3,7 @@
 //! and the caller gets the JSON with the publisher's answer once Walrus's blob ID is the one the
 //! enclave signed.
 
-use std::time::Duration;
+use std::{pin::Pin, time::Duration};
 
 use axum::{
     Json,
@@ -11,12 +11,15 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use bytes::Bytes;
-use futures_util::{StreamExt as _, stream};
+use futures_util::{Stream, StreamExt as _, stream};
 use http_body_util::BodyExt as _;
 use serde_json::{Map, Value};
 use url::Url;
 
-use crate::{enclave::Opened, refuse};
+use crate::{
+    enclave::{AbortOnDrop, Opened},
+    refuse,
+};
 
 /// The media type of the enclave's `/measure` response.
 pub const MEASURED_MASTER_TYPE: &str = "application/vnd.miso.measured-master";
@@ -85,9 +88,18 @@ fn stored_blob_id(answer: &Value) -> Option<&str> {
         .as_str()
 }
 
-/// Uploads the ciphertext of `opened`, a measured master, and answers its JSON with `walrus`,
-/// the publisher's answer, added; or an error if the upload fails or stores another blob ID.
-pub async fn store(client: &reqwest::Client, publisher: &Publisher, opened: Opened) -> Response {
+/// A measured master's JSON head, its blob ID and ciphertext size, and the ciphertext as it
+/// arrives: exactly `size` bytes, or an error.
+pub(crate) struct Measured {
+    pub head: Map<String, Value>,
+    pub blob_id: String,
+    pub size: u64,
+    pub ciphertext: Pin<Box<dyn Stream<Item = std::io::Result<Bytes>> + Send>>,
+    pub _connection: AbortOnDrop,
+}
+
+/// Reads the JSON head of `opened`, a measured master, up to the newline before its ciphertext.
+pub(crate) async fn split(opened: Opened) -> Result<Measured, String> {
     let Opened {
         response,
         _connection,
@@ -97,10 +109,8 @@ pub async fn store(client: &reqwest::Client, publisher: &Publisher, opened: Open
     let rest = loop {
         let chunk = match body.next().await {
             Some(Ok(chunk)) => chunk,
-            Some(Err(error)) => {
-                return enclave_failed(format!("reading the response failed: {error}"));
-            }
-            None => return enclave_failed("the response ended before its ciphertext".into()),
+            Some(Err(error)) => return Err(format!("reading the response failed: {error}")),
+            None => return Err("the response ended before its ciphertext".into()),
         };
         if let Some(newline) = chunk.iter().position(|&byte| byte == b'\n') {
             head.extend_from_slice(&chunk[..newline]);
@@ -108,7 +118,7 @@ pub async fn store(client: &reqwest::Client, publisher: &Publisher, opened: Open
         }
         head.extend_from_slice(&chunk);
         if head.len() > HEAD_BYTES {
-            return enclave_failed("the response's JSON is too long".into());
+            return Err("the response's JSON is too long".into());
         }
     };
     let parsed: Option<(Map<String, Value>, String, u64)> = (|| {
@@ -117,11 +127,11 @@ pub async fn store(client: &reqwest::Client, publisher: &Publisher, opened: Open
         let size = measured.get("ciphertext_size")?.as_str()?.parse().ok()?;
         Some((measured, blob_id, size))
     })();
-    let Some((mut measured, blob_id, size)) = parsed else {
-        return enclave_failed("the response's JSON has no blob_id or ciphertext_size".into());
+    let Some((head, blob_id, size)) = parsed else {
+        return Err("the response's JSON has no blob_id or ciphertext_size".into());
     };
     if rest.len() as u64 > size {
-        return enclave_failed("the response is longer than its ciphertext".into());
+        return Err("the response is longer than its ciphertext".into());
     }
     let mut remaining = size - rest.len() as u64;
     let ciphertext = stream::once(async move { Ok::<Bytes, std::io::Error>(rest) }).chain(
@@ -133,6 +143,28 @@ pub async fn store(client: &reqwest::Client, publisher: &Publisher, opened: Open
             Ok(chunk)
         }),
     );
+    Ok(Measured {
+        head,
+        blob_id,
+        size,
+        ciphertext: Box::pin(ciphertext),
+        _connection,
+    })
+}
+
+/// Uploads the ciphertext of `opened`, a measured master, and answers its JSON with `walrus`,
+/// the publisher's answer, added; or an error if the upload fails or stores another blob ID.
+pub async fn store(client: &reqwest::Client, publisher: &Publisher, opened: Opened) -> Response {
+    let Measured {
+        head: mut measured,
+        blob_id,
+        size,
+        ciphertext,
+        _connection,
+    } = match split(opened).await {
+        Ok(measured) => measured,
+        Err(message) => return enclave_failed(message),
+    };
     let upload = client
         .put(publisher.blobs_url())
         .header(header::CONTENT_LENGTH, size)

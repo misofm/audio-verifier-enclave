@@ -1,10 +1,14 @@
-//! The parent instance's gateway to the enclave: `POST /measure` downloads a file from an R2
-//! presigned URL, streams it into the enclave's `/measure`, and streams the encrypted master the
-//! enclave returns to a Walrus publisher; `POST /attest` and `GET /health` pass through. It
-//! keeps no state; callers retry on 429 and 5xx.
+//! The parent instance's gateway to the enclave. `GET /upload` is a WebSocket that relays a
+//! browser's encrypted upload (HPKE, to a key only the enclave holds) into the enclave's
+//! `/upload`, and stores the encrypted master the enclave returns in R2 through a presigned
+//! `PUT`. `POST /measure`, for masters uploaded before, downloads a file from an R2 presigned
+//! URL, streams it into the enclave's `/measure`, and streams the encrypted master to a Walrus
+//! publisher. `POST /attest` and `GET /health` pass through. It keeps no state; callers retry
+//! on 429 and 5xx.
 
 mod enclave;
 mod policy;
+mod upload;
 mod walrus;
 
 use std::{
@@ -129,6 +133,7 @@ pub fn app(config: Config, client: reqwest::Client, uploads: reqwest::Client) ->
     let not_found = || async { refuse(StatusCode::NOT_FOUND, "not_found", "no such route") };
     Router::new()
         .route("/measure", post(measure))
+        .route("/upload", get(upload::upload))
         .route("/attest", post(attest))
         .route("/health", get(health))
         .with_state(Arc::new(gateway))
