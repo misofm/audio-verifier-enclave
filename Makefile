@@ -13,6 +13,7 @@ $(OUT_DIR):
 	mkdir -p $(OUT_DIR)
 
 $(OUT_DIR)/nitro.eif: $(EIF_INPUTS) | $(OUT_DIR)
+	rm -rf vendor
 	cargo vendor --locked vendor > vendor.toml
 	mv vendor.toml vendor/config.toml
 	docker build \
