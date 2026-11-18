@@ -16,6 +16,10 @@ $(OUT_DIR)/nitro.eif: $(EIF_INPUTS) | $(OUT_DIR)
 	rm -rf vendor
 	cargo vendor --locked vendor > vendor.toml
 	mv vendor.toml vendor/config.toml
+	# Vendored files keep crates.io's fixed 2006 mtime, and BuildKit's context transfer reuses
+	# a cached file of the same path, size and mtime: a crate's new version could arrive with
+	# an old version's files. The image never sees these mtimes.
+	find vendor -exec touch {} +
 	docker build \
 		--pull \
 		--progress=plain \
