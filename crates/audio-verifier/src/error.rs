@@ -12,9 +12,34 @@ pub enum Error {
     /// First metadata block is not STREAMINFO.
     #[error("first metadata block has type {0}, expected STREAMINFO")]
     WrongFirstBlock(u8),
-    /// STREAMINFO is followed by other metadata blocks.
-    #[error("STREAMINFO must be the only metadata block")]
-    ExtraMetadata,
+    /// A metadata block other than PADDING, SEEKTABLE or VORBIS_COMMENT follows STREAMINFO.
+    #[error(
+        "metadata block type {0} is not accepted: only PADDING, SEEKTABLE and VORBIS_COMMENT \
+         may follow STREAMINFO"
+    )]
+    MetadataBlock(u8),
+    /// The metadata blocks after STREAMINFO exceed
+    /// [`MAX_EXTRA_METADATA_BYTES`](crate::MAX_EXTRA_METADATA_BYTES).
+    #[error("metadata after STREAMINFO exceeds 65536 bytes")]
+    MetadataTooLong,
+    /// A SEEKTABLE block is not a whole number of 18-byte seek points.
+    #[error("SEEKTABLE length is {0}, not a multiple of 18")]
+    SeekTableLength(u32),
+    /// A VORBIS_COMMENT block's lengths do not add up to the block.
+    #[error("VORBIS_COMMENT block is malformed")]
+    VorbisComment,
+    /// More than one WAVEFORMATEXTENSIBLE_CHANNEL_MASK field.
+    #[error("WAVEFORMATEXTENSIBLE_CHANNEL_MASK appears more than once")]
+    ChannelMaskRepeated,
+    /// A WAVEFORMATEXTENSIBLE_CHANNEL_MASK value that is not `0x` and hexadecimal digits.
+    #[error("WAVEFORMATEXTENSIBLE_CHANNEL_MASK value {0:?} is not 0x and at most 8 hex digits")]
+    ChannelMaskValue(String),
+    /// A channel mask with bits above 17, the last speaker position.
+    #[error("channel mask {0:#x} has bits above 17, the last speaker position")]
+    ChannelMaskBits(u32),
+    /// A channel mask that assigns more speakers than there are channels.
+    #[error("channel mask {mask:#x} assigns more speakers than the {channels} channels")]
+    ChannelMaskChannels { mask: u32, channels: u8 },
     /// STREAMINFO block length is not 34.
     #[error("STREAMINFO length is {0}, expected 34")]
     StreamInfoLength(u32),
@@ -24,9 +49,6 @@ pub enum Error {
     /// STREAMINFO total samples is zero.
     #[error("STREAMINFO total samples is zero")]
     ZeroTotalSamples,
-    /// 32-bit FLAC is excluded by the attestation policy.
-    #[error("32-bit FLAC is not supported")]
-    Unsupported32Bit,
     /// Bit depth outside 8, 16 and 24.
     #[error("unsupported bit depth {0}")]
     UnsupportedBitDepth(u8),
@@ -36,6 +58,12 @@ pub enum Error {
     /// STREAMINFO block sizes break `16 <= min_block_size <= max_block_size`.
     #[error("STREAMINFO block sizes {min} to {max} are not within 16 to 65535 in order")]
     BlockSizeBounds { min: u16, max: u16 },
+    /// STREAMINFO declares more decoded PCM than [`MAX_DECODED_BYTES`](crate::MAX_DECODED_BYTES).
+    #[error("decoded PCM exceeds the 4 GiB service limit")]
+    DecodedTooLarge,
+    /// Reading a streamed file failed.
+    #[error("reading the input failed: {0}")]
+    Read(String),
     /// Decoder error.
     #[error("FLAC decode failed: {0}")]
     Decode(String),

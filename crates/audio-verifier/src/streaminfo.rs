@@ -1,9 +1,10 @@
-use crate::{Error, SUPPORTED_BIT_DEPTHS, SUPPORTED_SAMPLE_RATES};
+use crate::{Error, MAX_DECODED_BYTES, SUPPORTED_BIT_DEPTHS, SUPPORTED_SAMPLE_RATES};
 
 const FLAC_MAGIC: [u8; 4] = *b"fLaC";
 const STREAMINFO_TYPE: u8 = 0;
 const STREAMINFO_LENGTH: u32 = 34;
-const HEADER_LENGTH: usize = 8 + STREAMINFO_LENGTH as usize;
+/// The `fLaC` marker and the STREAMINFO block, header included.
+pub(crate) const HEADER_LENGTH: usize = 8 + STREAMINFO_LENGTH as usize;
 const MIN_BLOCK_SIZE_OFFSET: usize = 8;
 const MAX_BLOCK_SIZE_OFFSET: usize = 10;
 const MIN_FRAME_SIZE_OFFSET: usize = 12;
@@ -12,9 +13,9 @@ const PACKED_OFFSET: usize = 18;
 const MD5_OFFSET: usize = 26;
 const MIN_BLOCK_SIZE_FLOOR: u16 = 16;
 
-/// STREAMINFO fields of a canonical FLAC file.
+/// STREAMINFO fields of a FLAC file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct StreamInfo {
+pub(crate) struct StreamInfo {
     /// Smallest block size in samples, excluding the last block.
     pub min_block_size: u16,
     /// Largest block size in samples.
@@ -36,8 +37,9 @@ pub struct StreamInfo {
 }
 
 impl StreamInfo {
-    /// Parses STREAMINFO, requiring it to be the first and only metadata block.
-    pub fn parse_canonical(bytes: &[u8]) -> Result<Self, Error> {
+    /// Parses the `fLaC` marker and STREAMINFO from the first [`HEADER_LENGTH`] bytes of a file,
+    /// requiring STREAMINFO to be the first metadata block. Also returns whether it is the last.
+    pub(crate) fn parse(bytes: &[u8]) -> Result<(Self, bool), Error> {
         if bytes.len() < HEADER_LENGTH {
             return Err(Error::TooShort(bytes.len()));
         }
@@ -49,16 +51,13 @@ impl StreamInfo {
         if block_type != STREAMINFO_TYPE {
             return Err(Error::WrongFirstBlock(block_type));
         }
-        if block_header & 0x80 == 0 {
-            return Err(Error::ExtraMetadata);
-        }
         let length = u32::from_be_bytes([0, bytes[5], bytes[6], bytes[7]]);
         if length != STREAMINFO_LENGTH {
             return Err(Error::StreamInfoLength(length));
         }
 
         let packed = u64::from_be_bytes(read_array(bytes, PACKED_OFFSET));
-        Ok(Self {
+        let info = Self {
             min_block_size: u16::from_be_bytes(read_array(bytes, MIN_BLOCK_SIZE_OFFSET)),
             max_block_size: u16::from_be_bytes(read_array(bytes, MAX_BLOCK_SIZE_OFFSET)),
             min_frame_size: read_u24(bytes, MIN_FRAME_SIZE_OFFSET),
@@ -68,19 +67,17 @@ impl StreamInfo {
             bit_depth: ((packed >> 36) & 0x1f) as u8 + 1,
             total_samples: packed & 0x0f_ffff_ffff,
             md5: read_array(bytes, MD5_OFFSET),
-        })
+        };
+        Ok((info, block_header & 0x80 != 0))
     }
 
-    /// Applies the attestation rules that STREAMINFO alone can decide.
-    pub fn validate(&self) -> Result<(), Error> {
+    /// Applies the attestation rules and the decoded-PCM limit, which STREAMINFO alone decides.
+    pub(crate) fn validate(&self) -> Result<(), Error> {
         if self.md5 == [0; 16] {
             return Err(Error::ZeroMd5);
         }
         if self.total_samples == 0 {
             return Err(Error::ZeroTotalSamples);
-        }
-        if self.bit_depth == 32 {
-            return Err(Error::Unsupported32Bit);
         }
         if !SUPPORTED_BIT_DEPTHS.contains(&self.bit_depth) {
             return Err(Error::UnsupportedBitDepth(self.bit_depth));
@@ -94,11 +91,18 @@ impl StreamInfo {
                 max: self.max_block_size,
             });
         }
+        let decoded_bytes = self
+            .total_samples
+            .checked_mul(u64::from(self.channels))
+            .and_then(|samples| samples.checked_mul(self.bytes_per_sample() as u64));
+        if decoded_bytes.is_none_or(|size| size > MAX_DECODED_BYTES) {
+            return Err(Error::DecodedTooLarge);
+        }
         Ok(())
     }
 
     /// Bytes per sample in the digested PCM stream, `ceil(bit_depth / 8)`.
-    pub fn bytes_per_sample(&self) -> usize {
+    pub(crate) fn bytes_per_sample(&self) -> usize {
         usize::from(self.bit_depth.div_ceil(8))
     }
 }

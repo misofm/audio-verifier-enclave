@@ -1,34 +1,12 @@
 #!/bin/sh
+# Fails if the enclave binary's build enables nautilus/test-utils, whose development identity
+# has a public signing key. Run by Containerfile.eif before the build.
 set -eu
 
-if [ "$#" -lt 1 ]; then
-	echo "usage: $0 <package> [target] [cargo tree args...]" >&2
-	exit 2
-fi
-
-package=$1
-shift
-if [ "$#" -gt 0 ]; then
-	case $1 in
-	-*) ;;
-	*)
-		target=$1
-		shift
-		set -- --target "$target" "$@"
-		;;
-	esac
-fi
-
-if ! cargo tree --locked -p "$package" -e normal --prefix none "$@" | grep -q '^nautilus v'; then
-	echo "error: $package does not depend on nautilus; check the package name" >&2
-	exit 1
-fi
-
-tree=$(cargo tree --locked -p "$package" -e normal,features -i nautilus --prefix none "$@")
-
+tree=$(cargo tree --locked -p audio-verifier-enclave --target x86_64-unknown-linux-musl \
+	-e normal,features -i nautilus --prefix none "$@")
 if printf '%s\n' "$tree" | grep -q '^nautilus feature "test-utils"'; then
-	echo "error: $package enables nautilus/test-utils; refusing to build an enclave with a public development identity" >&2
+	echo "error: audio-verifier-enclave enables nautilus/test-utils" >&2
 	exit 1
 fi
-
-echo "ok: $package does not enable nautilus/test-utils"
+echo "ok: audio-verifier-enclave does not enable nautilus/test-utils"

@@ -1,11 +1,8 @@
-REGISTRY ?= local
 OUT_DIR ?= out
-ENCLAVE_PACKAGE ?= audio-verifier-enclave
-ENCLAVE_BIN ?= $(ENCLAVE_PACKAGE)
 ENCLAVE_CID ?= 16
 ENCLAVE_CPUS ?= 4
 ENCLAVE_MEMORY ?= 6144M
-EIF_INPUTS := Cargo.toml Cargo.lock rust-toolchain.toml Containerfile.eif .dockerignore $(shell find crates eif scripts -type f -not -path '*/target/*')
+EIF_INPUTS := Cargo.toml Cargo.lock rust-toolchain.toml Containerfile.eif .dockerignore $(shell find crates scripts -type f -not -path '*/target/*')
 
 .DEFAULT_GOAL := eif
 
@@ -16,18 +13,20 @@ $(OUT_DIR):
 	mkdir -p $(OUT_DIR)
 
 $(OUT_DIR)/nitro.eif: $(EIF_INPUTS) | $(OUT_DIR)
+	rm -rf vendor
 	cargo vendor --locked vendor > vendor.toml
 	mv vendor.toml vendor/config.toml
+	# Vendored files keep crates.io's fixed 2006 mtime, and BuildKit's context transfer reuses
+	# a cached file of the same path, size and mtime: a crate's new version could arrive with
+	# an old version's files. The image never sees these mtimes.
+	find vendor -exec touch {} +
 	docker build \
 		--pull \
-		--tag $(REGISTRY)/audio-verifier-enclave \
 		--progress=plain \
 		--platform linux/amd64 \
 		--provenance=false \
 		--output type=local,rewrite-timestamp=true,dest=$(OUT_DIR) \
 		-f Containerfile.eif \
-		--build-arg ENCLAVE_PACKAGE=$(ENCLAVE_PACKAGE) \
-		--build-arg ENCLAVE_BIN=$(ENCLAVE_BIN) \
 		.
 
 .PHONY: run-eif
@@ -40,7 +39,7 @@ run-eif: $(OUT_DIR)/nitro.eif
 
 .PHONY: run-eif-debug
 run-eif-debug: $(OUT_DIR)/nitro.eif
-	@echo 'WARNING: debug mode reports all-zero PCRs; this enclave cannot be attested or registered with Kagi.' >&2
+	@echo 'WARNING: debug mode reports all-zero PCRs; this enclave cannot be attested or registered on chain.' >&2
 	sudo nitro-cli run-enclave \
 		--cpu-count $(ENCLAVE_CPUS) \
 		--memory $(ENCLAVE_MEMORY) \

@@ -1,71 +1,216 @@
 # Nautilus Audio Verifier
 
-Measures FLAC audio inside a Nautilus enclave on AWS Nitro and verifies the signed results on Sui. It checks the decoded audio, computes a BLAKE3 PCM digest, and signs the audio's channels, bit depth, sample rate, sample count and PCM digest. It signs nothing about the file itself.
+Measures and encrypts FLAC masters inside a Nautilus enclave on AWS Nitro, and verifies the signed results on Sui. It decodes and checks the file, reads its channel layout, encrypts the whole file under a fresh key (the DEK), computes the Walrus blob ID of the ciphertext, and Seal-encrypts the DEK so that only the Recording's owner can get it back. It signs the audio's channels, bit depth, sample rate, sample count, BLAKE3 PCM digest and channel layout with the blob ID and the sealed DEK, and separately the size and SHA-256 of the file it measured, for off-chain verifiers. The DEK never leaves the enclave unsealed.
 
-The [`audio_verifier`](https://github.com/misofm/framework/tree/main/audio_verifier) Move package, in `misofm/framework`, verifies the signature and creates the canonical, frozen `Audio<AudioVerifier>` for use by other applications. Files are not on-chain: anyone can check a file against an Audio by decoding it and comparing the BLAKE3 digest of its PCM with `pcm_digest`. This verifies technical properties of the audio; it does not establish authorship or ownership.
+The [`audio_verifier`](https://github.com/misofm/framework/tree/main/audio_verifier) Move package, in `misofm/framework`, verifies the signature and returns an `Audio<AudioVerifier, Pcm, ChannelLayout>` whose data is the encrypted Walrus blob, which `recording_master` stores on the Recording. `recording_master_seal` is the Seal policy that releases the DEK to the holder of that Recording's admin cap. This verifies technical properties of the audio; it does not establish authorship or ownership.
 
 ## Supported input
 
-The service accepts canonical FLAC files with:
+The service accepts FLAC files with:
 
-- STREAMINFO as the only metadata block, with a nonzero MD5 and sample count.
+- STREAMINFO as the first metadata block, with a nonzero MD5 and sample count.
+- After it, only PADDING, SEEKTABLE and VORBIS_COMMENT blocks, at most 64 KiB in total including their 4-byte headers. Any other block type (APPLICATION, CUESHEET, PICTURE or a reserved type), more metadata, or a SEEKTABLE that is not whole 18-byte seek points is rejected.
 - 8-, 16-, or 24-bit samples.
 - Sample rates of 44.1, 48, 88.2, 96, 176.4, 192, 352.8, or 384 kHz.
-- Metadata and frame contents that agree with the decoded audio.
+- Frames of at most 16,777,215 bytes (2^24 - 1, the most STREAMINFO's `max_frame_size` can declare).
+- Metadata and frame contents that agree with the decoded audio, and no bytes after the last frame.
+- At most 256 MiB of file and 4 GiB of decoded PCM across all channels, the latter checked from STREAMINFO before any frame is decoded.
 
-Uploads default to a 256 MiB limit. Decoded PCM is limited to 4 GiB across all channels. Non-FLAC files and invalid audio are rejected without a signature.
+Accepted metadata blocks do not change the PCM facts: a file decodes to the same digest as its copy with tags and padding removed. One Vorbis comment field changes the channel layout (see [Channel layout](#channel-layout)), so each VORBIS_COMMENT block must be well formed, its lengths adding up to the block exactly. The file binding (intent 2) covers every block, because it hashes the file's bytes, and so does the encryption, which is of the whole file. The blocks are not otherwise checked: a repeated SEEKTABLE or VORBIS_COMMENT is accepted, and so is PADDING that is not zero, which can carry up to 64 KiB of arbitrary bytes. None of it reaches the decoded audio.
 
-## Run locally
+### Channel layout
 
-Install Rust using the version in `rust-toolchain.toml` and a C compiler, then start the development service:
+`channel_layout` names one speaker position per channel, in channel order, by the bit positions of the WAVE channel mask (RFC 9639, section 8.6.2): 0 FL, 1 FR, 2 FC, 3 LFE, 4 BL, 5 BR, 6 FLC, 7 FRC, 8 BC, 9 SL, 10 SR, 11 TC, 12 TFL, 13 TFC, 14 TFR, 15 TBL, 16 TBC, 17 TBR, and 255 for a channel with no position.
 
-```sh
-cargo run --locked -p audio-verifier-enclave --features dev
+| Channels | Default layout | |
+|---|---|---|
+| 1 | `[2]` | mono is front center |
+| 2 | `[0, 1]` | |
+| 3 | `[0, 1, 2]` | |
+| 4 | `[0, 1, 4, 5]` | |
+| 5 | `[0, 1, 2, 9, 10]` | |
+| 6 | `[0, 1, 2, 3, 9, 10]` | |
+| 7 | `[0, 1, 2, 3, 8, 9, 10]` | |
+| 8 | `[0, 1, 2, 3, 4, 5, 9, 10]` | |
+
+The defaults are FLAC's channel assignment (RFC 9639, section 9.1.3) in the speakers libFLAC's reference decoder writes for it (`src/flac/decode.c`, masks `0x4`, `0x3`, `0x7`, `0x33`, `0x607`, `0x60f`, `0x70f`, `0x63f`): the RFC's "back/surround" pair of five and six channels is side left and right, as in ffmpeg's `5.1(side)`, for which ffmpeg writes no mask.
+
+A `WAVEFORMATEXTENSIBLE_CHANNEL_MASK` field in a VORBIS_COMMENT block overrides the default: its set bits, lowest first, are the positions of the channels in order, and channels past them are 255 (a mask of `0x0` assigns none). The field's name and value are compared without regard to case; the value is `0x` and hexadecimal digits, zero padding allowed. A file is rejected (422) if the field appears more than once, its value is not `0x` and at most 8 significant hex digits, the mask has bits above 17, or it has more bits than the file has channels.
+
+## API
+
+The service serves HTTP on vsock port 3000. Errors are JSON `{ "error": code, "message": text }`, and a rejected file never receives a signature.
+
+| Route | Body | Response |
+|---|---|---|
+| `POST /measure?recording_id=<hex>` | the FLAC file, streamed, with `Content-Length` | `application/vnd.miso.measured-master`: the JSON below, a newline (`0x0a`), then the ciphertext |
+| `POST /attest` | `{ "nonce": hex }` | `{ "attestation": hex }`, the NSM document binding `public_key` |
+| `GET /health` | | `{ "pk", "address" }` |
+
+`recording_id` is the object ID of the Recording the master is for, 32 bytes as 64 hex digits with or without `0x`, given once (400 `invalid_request` otherwise). The Recording need not exist yet. `/measure` decodes and encrypts the file as it arrives and stops reading as soon as it is rejected. A file gets the same verdict and error however its body is chunked. A response starts with this JSON, on one line:
+
+```json
+{
+  "audio": {
+    "intent": 0, "timestamp_ms": 1795009433120,
+    "channels": 2, "bit_depth": 24, "sample_rate_hz": 48000,
+    "samples_per_channel": "12000",
+    "pcm_digest": "<64 hex>",
+    "channel_layout": [0, 1],
+    "blob_id": "c9CahVauOiY5MCqjTME7q0FQWY28henaFQ_fm66g_yc",
+    "blob_id_u256": "<decimal>",
+    "sealed_dek": "<hex, 347 bytes>",
+    "signature": "<128 hex>"
+  },
+  "master_file": {
+    "intent": 2, "timestamp_ms": 1795009433120,
+    "file_size": "35201", "file_sha256": "<64 hex>", "signature": "<128 hex>"
+  },
+  "ciphertext_size": "35257",
+  "public_key": "<64 hex>"
+}
 ```
 
-This listens on `127.0.0.1:3000` with a fixed development identity. It is for local testing only.
+`samples_per_channel`, `file_size` and `ciphertext_size` are decimal strings. `blob_id` is the Walrus blob ID as Walrus prints it (URL-safe base64 of its 32 bytes, without padding), and `blob_id_u256` the same number as the decimal `u256` that `verify_audio` takes. `sealed_dek` is the BCS of the Seal `EncryptedObject`. Both signatures carry the same `timestamp_ms`, the enclave's clock when it signed. After the newline come exactly `ciphertext_size` bytes of ciphertext; the response's `Content-Length` counts both. Errors are JSON as above, with no ciphertext.
 
-Prepare a copy of your FLAC file by removing tags and other metadata with `metaflac` (from the FLAC tools), then upload it:
+| `/measure` | |
+|---|---|
+| File size | `Content-Length` required (411 `length_required`); over 256 MiB, 413 `body_too_large` |
+| Concurrency | one measurement per vCPU, fewer if memory is short (see [Sizing](#sizing)); more get 429 `overloaded` |
+| Body | nothing received for 30 s: 408 `body_read_timeout`; a read error, or other than `Content-Length` bytes: 400 `body_read_failed` |
+| Request | 600 s for the body, the measurement, the blob ID and the sealing: 408 `request_timeout` |
+| Response | the ciphertext is sent within 600 s, and a reader that takes nothing for 30 s is cut off; the job's slot is held until then |
+| Memory | decoding holds about 1 MiB of the file for typical frames and at most 48 MiB; the ciphertext is held whole, the file's size plus 16 bytes a MiB, and computing its blob ID takes about 0.6 times as much again: a 252 MiB file's job peaks at 423 MiB, within the 512 MiB budgeted per job |
+| Time | a 252 MiB file takes about 3.4 s after its body has arrived (release build, one core) |
+| Rejected file | 422 `application_error`, the reason in `message` |
+| Internal failure | 500 `internal_error`; a blob ID or Seal failure is logged |
 
-```sh
-cp audio.flac canonical.flac
-metaflac --remove-all --dont-use-padding canonical.flac
-curl --fail-with-body http://127.0.0.1:3000/process_data \
-  -H 'Content-Type: application/octet-stream' \
-  --data-binary @canonical.flac
+`/attest` requires a non-empty hex `nonce` of at most 512 bytes and accepts no other field (400 `invalid_request`). Its body may be at most 4 KiB (413 `body_too_large`), and the request has 30 s (408 `request_timeout`). It attests one request at a time, after the body has arrived; others get 429 `overloaded`, and a failing attestation provider 503 `attestation_unavailable`.
+
+Unknown routes get 404 `not_found`, other methods 405 `method_not_allowed`. The service closes connections beyond 256, connections whose request headers take more than 10 s, and idle connections after 30 s.
+
+## The encrypted master
+
+| | |
+|---|---|
+| Encryption | Tink streaming AEAD `AES256_GCM_HKDF_1MB` (`AesGcmHkdfStreaming`, 1,048,576-byte ciphertext segments, HKDF-SHA256, 32-byte derived keys), the wire format byte for byte. The DEK is 32 random bytes from the kernel, and is Tink's raw key value. The associated data is empty. |
+| Blob ID | walrus-core at `testnet-v1.60.2` (`29c3d1a`), `EncodingType::RS2` at 1,000 shards, Walrus testnet's shard count (system object `0x6c2547cb…f6af`, epoch 585) |
+| Seal | `crypto` from MystenLabs/seal at `seal-v0.6.16` (`54eff6a`): the DEK is the AES-256-GCM plaintext of an `EncryptedObject`, with empty associated data, as `@mysten/seal`'s `encrypt` makes by default |
+| Key server | Seal's decentralized testnet key server `0xb012378c9f3799fb5b1a7083da74a4069e3c3f1c93de0b27212a5799ce1e1e98` (a 3-of-5 committee behind one key), threshold 1, its `KeyServerV2` public key pinned |
+| Policy | `recording_master_seal` `0xf2452914718b6f8d3cadef6e04d390fb66b496e7e5095de67b254eecbd77b6fb` |
+| Identity | `bcs(recording_id: address) ‖ bcs(blob_id: u256)`, 64 bytes: the Recording's object ID, then the blob ID's 32 bytes, which are Walrus's raw blob ID bytes and the little-endian `u256` |
+
+The pins are constants in [`crates/audio-verifier-enclave/src/master.rs`](crates/audio-verifier-enclave/src/master.rs), so they are part of the image and its PCRs; changing one is a new image, registered again. At boot the service checks the decoder, a Tink known answer and a Walrus blob ID against recorded answers, and parses the pinned key, and refuses to start if any fails.
+
+The ciphertext is app-v2's `src/posts/tink.ts` format with 1 MiB segments in place of 64 KiB ones: its header (one length byte, 40, a 32-byte salt and a 7-byte nonce prefix), its key derivation and its per-segment nonces (`prefix ‖ u32be(index) ‖ last`) are the same. A browser decrypts it with that file once its `SEGMENT_BYTES` is a parameter. [`interop/`](interop) proves both directions of agreement with outside code (see [Test](#test)).
+
+Seal's identity names the Recording as well as the blob: blob IDs are public, so with the blob alone anyone could attach the same blob ID to their own Recording and pass the policy. The Recording ID is not in the signed payload; it is in the sealed DEK's own header, and the policy enforces it.
+
+## What is signed
+
+Each message is Ed25519-signed with the enclave's per-boot key over `bcs(IntentMessage { intent: u8, timestamp_ms: u64, data })`:
+
+```
+intent 0, verified on chain by audio_verifier::verify_audio:
+  AudioPayload {
+    channels: u8, bit_depth: u8, sample_rate_hz: u32, samples_per_channel: u64,
+    pcm_digest: vector<u8>,      // 32 bytes, BLAKE3 of the decoded PCM
+    channel_layout: vector<u8>,  // one speaker position per channel
+    blob_id: u256,               // Walrus blob ID of the ciphertext
+    sealed_dek: vector<u8>,      // BCS of the Seal EncryptedObject of the DEK
+  }
+
+intent 2, verified off chain:
+  MasterFilePayload {
+    audio: AudioPayload,         // the same payload as intent 0, nested
+    file_size: u64,              // bytes of the file as received
+    file_sha256: vector<u8>,     // 32 bytes, SHA-256 of those bytes
+  }
 ```
 
-The JSON response contains `audio` (the facts, with its `intent` 0, `timestamp_ms` and `signature`) and `public_key`.
+Integers are little-endian, `u256` is 32 bytes with no length prefix, and each `vector<u8>` is prefixed with its ULEB128 length. A `blob_id` of Walrus's raw bytes `b` is the `u256` whose BCS is `b`. `pcm_digest` hashes the PCM interleaved by sample frame, each sample signed little-endian in `ceil(bit_depth / 8)` bytes. Intent 1 was a retired payload and is not reused.
 
-Set the upload limit with `--max-body-bytes` after Cargo's `--`, or with `AUDIO_VERIFIER_MAX_BODY_BYTES`. The service processes one request at a time; concurrent uploads receive HTTP 429. Invalid audio receives HTTP 422 and oversized uploads receive HTTP 413.
+No Move package consumes intent 2. An off-chain verifier rebuilds `MasterFilePayload` from the response's `audio` fields and `master_file` fields, checks the signature with `public_key`, checks that the key is registered at the current version of the on-chain enclave policy, and compares `file_size` and `file_sha256` with the plaintext it expects. A future Move consumer would declare the same structs and call `policy.verify_signature(pk, 2, timestamp_ms, payload, &signature)`.
+
+[`vectors/audio_intent.json`](vectors/audio_intent.json) and [`vectors/master_file_intent.json`](vectors/master_file_intent.json) hold fixed payloads, their BCS, intent messages and signatures from the seed `[7; 32]`. The Rust tests regenerate them through the route's signing code and compare. The audio vector's payload, BCS and signatures are those of the `audio_verifier` Move package's own vector.
 
 ## Use on Sui
 
-Publish the [`audio_verifier` Move package](https://github.com/misofm/framework/tree/main/audio_verifier), configure its enclave policy, and register an attested enclave. For new audio, pass `audio`'s fields, timestamp and signature to `audio_verifier::audio_verifier::verify_audio`, which checks the signature against the registered enclave, then freeze the returned Audio with `audio.freeze()` in the same transaction.
-
-See its [README](https://github.com/misofm/framework/tree/main/audio_verifier) for the API and policy setup.
+Publish the [`audio_verifier` Move package](https://github.com/misofm/framework/tree/main/audio_verifier), configure its enclave policy, and register an attested enclave. Store the ciphertext on Walrus (the gateway does), then pass `audio`'s fields, `blob_id_u256` as the `blob_id`, the timestamp and the signature to `audio_verifier::audio_verifier::verify_audio(policy, channels, bit_depth, sample_rate_hz, samples_per_channel, pcm_digest, channel_layout, blob_id, sealed_dek, pk, timestamp_ms, signature)`, and attach the returned `Audio` to the Recording with `recording_master::add_master` in the same transaction. See its [README](https://github.com/misofm/framework/tree/main/audio_verifier) for the API and policy setup. On testnet, `audio_verifier` is `0x79cb3c048707800ea6219cf5f86ef22993837ccb912bba81035abc337e5454c0` and its `EnclavePolicy` `0xeb9fdb274f4edbda86b322cbb876a4f92aa6b9e58964d6d5953ff0cead49160e`.
 
 ## Run in an enclave
 
-The production build requires AWS Nitro's NSM device and serves HTTP on vsock port 3000. The enclave image requires an x86-64 CPU with AVX-512 and GFNI support.
-
-With Docker available, build the image; on a configured Nitro host with `nitro-cli`, run it:
+The image requires an x86-64 CPU with AVX-512 and GFNI, and AWS Nitro's NSM device. With Docker available, build it reproducibly; on a configured Nitro host with `nitro-cli`, run it:
 
 ```sh
 make eif
 make run-eif
 ```
 
-The image is written to `out/nitro.eif`. The default enclave allocation is four vCPUs and 6144 MiB of memory. Bridge clients to vsock port 3000 through the parent instance, and register the image's PCR measurements through the Move enclave policy before using its signatures on-chain. Never enable the `dev` feature in a production image.
+The image is written to `out/nitro.eif`, with its PCRs in `out/nitro.pcrs`. The default allocation is four vCPUs and 6144 MiB (`ENCLAVE_CPUS`, `ENCLAVE_MEMORY`). Register the image's PCRs through the Move enclave policy before using its signatures on-chain. A new version is a new image with new PCRs, so routes are not versioned.
+
+### Parent instance
+
+`host/` sets up an Amazon Linux 2023 parent with enclaves enabled. As root, from a checkout:
+
+```sh
+host/setup.sh out/nitro.eif 4 6144
+systemctl start audio-verifier-enclave argonaut audio-verifier-host
+```
+
+| Unit | What it runs |
+|---|---|
+| `audio-verifier-enclave` | `nitro-cli run-enclave` on `/opt/miso/audio-verifier.eif`, CID 16, at boot; vCPUs and memory from `/etc/miso/audio-verifier.env` |
+| `argonaut` | [argonaut](https://github.com/miraicloud/argonaut), pinned by commit in `setup.sh`: TCP `127.0.0.1:3000` to the enclave's vsock port 3000, at most 256 connections |
+| `audio-verifier-host` | the gateway in [`host/gateway`](host/gateway), built by `setup.sh` with rustup's Rust: HTTP on `127.0.0.1:4000`, the only service callers reach |
+
+- Every service listens only on loopback; whatever exposes the gateway beyond the instance, such as a Cloudflare Tunnel, must authenticate its callers.
+- The gateway keeps no state and no queue. `POST /measure` takes `{ "url": "<presigned R2 GET URL>", "recording_id": "<hex object ID>" }`, downloads the file and streams it into the enclave's `/measure` with the download's `Content-Length`. An enclave error returns unchanged; callers retry on 429 and 5xx. A measured master's ciphertext is streamed, as it arrives, to the Walrus publisher (`PUT /v1/blobs?epochs=<n>&permanent=true`), and the caller gets the enclave's JSON with `walrus`, the publisher's answer, added, once Walrus's blob ID (`newlyCreated.blobObject.blobId` or `alreadyCertified.blobId`) is the one the enclave signed. Another blob ID gets 502 `blob_id_mismatch`, a failed upload 502 `upload_failed`. `POST /attest` (body at most 4 KiB) and `GET /health` pass through; other routes and methods get 404 `not_found`.
+- The publisher is `https://publisher.walrus-testnet.walrus.space` unless `--walrus-publisher` names another, storing for 53 epochs (`--walrus-epochs`); `--walrus-send-object-to` sends the `Blob` objects to an address of yours rather than the publisher's. Publishers on the public internet do not authenticate; run your own, funded, for production.
+- It sends the enclave request as soon as the download's headers arrive, so an enclave 429 `overloaded` returns at once and the download is dropped. A download without `Content-Length` gets 502 `download_failed`, one over 256 MiB 413 `body_too_large`, before any body is read. A download that fails, redirects, answers other than 2xx, or delivers other than `Content-Length` bytes gets 502 `download_failed`; an unreachable enclave 502 `enclave_unavailable`.
+- Download URLs must be `https` on port 443, without credentials, with a host name ending in `.r2.cloudflarestorage.com` (`<account-id>.r2…` or `<account-id>.<jurisdiction>.r2…`); others get 400 `url_not_allowed`. Redirects are not followed and proxies not used. Names resolve only to public addresses: loopback, private, link-local (the `169.254.169.254` metadata service), shared, multicast and reserved ranges are refused, and the connection uses the checked addresses. `--allowed-host-suffix` (repeatable) replaces the suffix.
+- At most 16 `/measure` requests at once (`--max-in-flight`), more get 429 `overloaded`; files and ciphertexts are streamed, never buffered. Timeouts: 10 s to connect (`--connect-timeout-secs`), 20 s without download data (`--idle-timeout-secs`), 630 s up to the enclave's answer (`--request-timeout-secs`; the enclave allows 600 s), and 600 s for the upload (`--upload-timeout-secs`), after which it gets 504 `request_timeout`.
+- The gateway is its own Cargo workspace with its own `Cargo.lock`, excluded from the root workspace: it changes neither the enclave's `Cargo.lock`, its vendored dependencies, nor its binary.
+- Every enclave start, including a reboot or a spot stop and start, creates a new signing key. Register it with a fresh `/attest` document before its signatures verify.
+- The vCPU count must be even on instances with SMT, and the allocator reservation in `/etc/nitro_enclaves/allocator.yaml` is written to match.
+
+### Sizing
+
+At boot the service sizes `/measure` to the enclave, from the vCPUs it may run on and `MemTotal` in `/proc/meminfo`, and logs the result:
+
+```
+[server] /measure jobs: 4 (4 vCPUs, MemTotal <n> MiB)
+```
+
+```
+jobs = max(1, min(vCPUs, (MemTotal - 128 MiB) / 48 MiB))
+```
+
+128 MiB is kept for the kernel, the in-memory root file system, the runtime and connections; 512 MiB is the worst case of one job (`MEASURE_JOB_BYTES`), a 256 MiB file's ciphertext and its blob ID computation. If `MemTotal` cannot be read, it counts as room for one job. Neither resource is part of the PCRs (`nitro-cli run-enclave --cpu-count --memory`), so an enclave can be resized without a new image or registration. vCPUs decide whenever memory has 128 MiB plus 512 MiB per vCPU: four vCPUs and 6 GiB run four jobs. Every job runs a decoder and a hasher thread, so give each job its own vCPU.
 
 ## Test
 
 ```sh
 cargo test --locked --workspace
+(cd host/gateway && cargo test --locked)
 ```
 
-Installing `ffmpeg` enables additional decoder cross-checks. The Move package's tests live with it in `misofm/framework`.
+`tests/memory_master.rs` runs a 252 MiB file through the route and checks its job's peak memory; it needs ffmpeg and a release build (`cargo test --release -p audio-verifier-enclave --test memory_master`). Every measurement case also runs in chunks of 1, 7, 4096 and 1 MiB bytes and must reach the same verdict, error included.
+
+The interop checks run against outside code. With an app-v2 checkout (for its `tink.ts` and its `@mysten/seal`) and Python's `tink` package (`pip install tink`):
+
+```sh
+cargo run --release -p audio-verifier-enclave --example interop -- interop/out <flac> <recording-id>
+node interop/check.mjs <app-v2> interop/out <flac> <recording-id>
+python3 interop/tink_check.py interop/out <flac>
+```
+
+The first writes a Tink known answer and `/measure`'s output, with the image's pins and with a key server key of its own, whose DEK it opens. `check.mjs` decrypts both ciphertexts with app-v2's `tink.ts` at 1 MiB segments, whole and streamed; parses the sealed DEK with `@mysten/seal` and checks its package, identity, key server and threshold; loads the key server from testnet through `@mysten/seal` and checks its public key is the pinned one; and has `@mysten/seal` encrypt to the same identity, for an object of the same shape and size. `tink_check.py` decrypts both with Google's Tink, keys built from the raw DEK and the `AES256_GCM_HKDF_1MB` template's parameters. The Walrus blob ID is checked against the CLI's answers for three fixtures in the unit tests and at boot, and against Walrus itself by the gateway on every upload.
+
+`cargo run --release -p audio-verifier-enclave --example dev_server` serves the routes on TCP `127.0.0.1:3000` with a fixed test identity, for running the gateway locally. A differential fuzz (`crates/audio-verifier/tests/differential.rs`, fixed seed) mutates seven files 150 times each and requires the same result from several chunkings of each; set `FUZZ_ITERATIONS` for a longer run. Installing `ffmpeg` enables cross-checks against an independent decoder. The Move package's tests live with it in `misofm/framework`.
 
 ## License
 
 [Functional Source License 1.1, ALv2 Future License](LICENSE.md). Vendored libFLAC is [BSD-3-Clause licensed](crates/libflac/flac-1.5.0/COPYING.Xiph); its notice must accompany binary distributions.
+
+`crates/libflac/flac-1.5.0` is the libFLAC 1.5.0 release's stream decoder. `scripts/vendor-libflac.sh` rebuilds it from the release archive, after checking its SHA-256, and applies [`crates/libflac/patches`](crates/libflac/patches) in order. There is one patch: [`0001-rice-tail-unary-limit.patch`](crates/libflac/patches/0001-rice-tail-unary-limit.patch) enforces the Rice decoder's unary-length limit when a code runs into the end of the buffered input, where 1.5.0 skipped it and decoded overlong codes to PCM other decoders do not produce. It is not fixed upstream as of November 2026.

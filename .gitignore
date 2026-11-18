@@ -1,3 +1,5 @@
 /target
 /out
 /vendor
+/host/gateway/target
+/interop/out

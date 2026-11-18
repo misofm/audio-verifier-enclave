@@ -107,6 +107,9 @@ incomplete_msbs:
 			msbs += x;
 			x = ucbits = 0;
 
+			if(msbs > limit)
+				return false;
+
 			if(0) {
 incomplete_lsbs:
 				br->consumed_bits = 0;

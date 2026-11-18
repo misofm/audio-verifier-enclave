@@ -1,7 +1,6 @@
 #![allow(dead_code)]
 
 use std::{
-    env,
     path::{Path, PathBuf},
     process::Command,
 };
@@ -18,27 +17,29 @@ pub fn fixture(name: &str) -> Vec<u8> {
     std::fs::read(fixture_path(name)).expect("fixture")
 }
 
-pub fn ffmpeg() -> Option<PathBuf> {
-    let candidate = env::var_os("FFMPEG")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/usr/bin/ffmpeg"));
-    Command::new(&candidate)
+/// Whether `ffmpeg` runs, for the optional cross-checks against an independent decoder.
+pub fn has_ffmpeg() -> bool {
+    Command::new("ffmpeg")
         .arg("-version")
         .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .map(|_| candidate)
+        .is_ok_and(|output| output.status.success())
 }
 
 pub fn scratch_file(name: &str, bytes: &[u8]) -> PathBuf {
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("audio-verifier");
     std::fs::create_dir_all(&dir).expect("scratch dir");
     let path = dir.join(name);
-    std::fs::write(&path, bytes).expect("scratch file");
+    let partial = dir.join(format!(
+        "{name}.{}.{:?}.partial",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::write(&partial, bytes).expect("scratch file");
+    std::fs::rename(&partial, &path).expect("scratch file");
     path
 }
 
-pub fn ffmpeg_raw_pcm(ffmpeg: &Path, flac: &Path, bit_depth: u8) -> Vec<u8> {
+pub fn ffmpeg_raw_pcm(flac: &Path, bit_depth: u8) -> Vec<u8> {
     let format = match bit_depth {
         8 => "s8",
         16 => "s16le",
@@ -50,7 +51,7 @@ pub fn ffmpeg_raw_pcm(ffmpeg: &Path, flac: &Path, bit_depth: u8) -> Vec<u8> {
         16 => "pcm_s16le",
         _ => "pcm_s24le",
     };
-    let output = Command::new(ffmpeg)
+    let output = Command::new("ffmpeg")
         .args([
             "-hide_banner",
             "-loglevel",
@@ -387,14 +388,14 @@ pub fn utf8_number(number: u32) -> Vec<u8> {
 }
 
 #[derive(Default)]
-struct BitWriter {
+pub struct BitWriter {
     bytes: Vec<u8>,
     current: u64,
     filled: u32,
 }
 
 impl BitWriter {
-    fn write(&mut self, value: u64, bits: u32) {
+    pub fn write(&mut self, value: u64, bits: u32) {
         for shift in (0..bits).rev() {
             self.current = (self.current << 1) | ((value >> shift) & 1);
             self.filled += 1;
@@ -406,7 +407,17 @@ impl BitWriter {
         }
     }
 
-    fn finish(mut self) -> Vec<u8> {
+    /// Writes `count` zero bits, whole bytes at a time where it can.
+    pub fn zeros(&mut self, mut count: usize) {
+        while self.filled != 0 && count > 0 {
+            self.write(0, 1);
+            count -= 1;
+        }
+        self.bytes.resize(self.bytes.len() + count / 8, 0);
+        self.write(0, (count % 8) as u32);
+    }
+
+    pub fn finish(mut self) -> Vec<u8> {
         if self.filled > 0 {
             self.bytes.push((self.current << (8 - self.filled)) as u8);
         }
@@ -414,7 +425,7 @@ impl BitWriter {
     }
 }
 
-fn crc8(bytes: &[u8]) -> u8 {
+pub fn crc8(bytes: &[u8]) -> u8 {
     let mut crc = 0u8;
     for byte in bytes {
         crc ^= byte;
@@ -429,10 +440,10 @@ fn crc8(bytes: &[u8]) -> u8 {
     crc
 }
 
-fn crc16(bytes: &[u8]) -> u16 {
-    let mut crc = 0u16;
-    for byte in bytes {
-        crc ^= u16::from(*byte) << 8;
+pub fn crc16(bytes: &[u8]) -> u16 {
+    let mut table = [0u16; 256];
+    for (byte, entry) in table.iter_mut().enumerate() {
+        let mut crc = (byte as u16) << 8;
         for _ in 0..8 {
             crc = if crc & 0x8000 != 0 {
                 (crc << 1) ^ 0x8005
@@ -440,6 +451,9 @@ fn crc16(bytes: &[u8]) -> u16 {
                 crc << 1
             };
         }
+        *entry = crc;
     }
-    crc
+    bytes.iter().fold(0u16, |crc, &byte| {
+        (crc << 8) ^ table[usize::from((crc >> 8) as u8 ^ byte)]
+    })
 }

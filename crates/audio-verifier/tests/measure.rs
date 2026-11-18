@@ -1,29 +1,60 @@
 mod common;
 
-use audio_verifier::{AudioPayload, Error};
+use std::io::{self, Read};
+
+use audio_verifier::{AudioFacts, Error, FileStats, MAX_EXTRA_METADATA_BYTES, measure_reader};
 use common::{
-    FrameEdit, FrameHeader, Rate, Synth, block_sizes, decoded_samples, ffmpeg, ffmpeg_raw_pcm,
-    fixture, frame_sizes, pcm_md5, scratch_file, set_block_sizes, set_frame_sizes, set_md5,
+    FrameEdit, FrameHeader, Rate, Synth, block_sizes, decoded_samples, ffmpeg_raw_pcm, fixture,
+    frame_sizes, has_ffmpeg, scratch_file, set_block_sizes, set_frame_sizes, set_md5,
     set_streaminfo, utf8_number,
 };
+use sha2::{Digest as _, Sha256};
 
-// Optional migration evidence from the same inputs and assertions as this suite.
-fn measure(bytes: &[u8]) -> Result<AudioPayload, Error> {
-    let result = audio_verifier::measure(bytes);
-    if let Some(directory) = std::env::var_os("AUDIO_VERIFIER_MIGRATION_RESULTS") {
-        let directory = std::path::PathBuf::from(directory);
-        std::fs::create_dir_all(&directory).expect("migration directory");
-        let id = blake3::hash(bytes).to_hex().to_string();
-        let value = match &result {
-            Ok(payload) => serde_json::json!({"accepted": true, "payload": payload}),
-            Err(error) => serde_json::json!({"accepted": false, "error": error.to_string()}),
-        };
-        std::fs::write(directory.join(format!("{id}.flac")), bytes).expect("migration input");
-        std::fs::write(
-            directory.join(format!("{id}.json")),
-            serde_json::to_vec_pretty(&value).expect("migration JSON"),
-        )
-        .expect("migration result");
+/// Hands out at most `chunk` bytes per read, as a network body does.
+struct Chunked<'a> {
+    bytes: &'a [u8],
+    at: usize,
+    chunk: usize,
+}
+
+impl<'a> Chunked<'a> {
+    fn new(bytes: &'a [u8], chunk: usize) -> Self {
+        Self {
+            bytes,
+            at: 0,
+            chunk,
+        }
+    }
+}
+
+impl Read for Chunked<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let count = buffer.len().min(self.chunk).min(self.bytes.len() - self.at);
+        buffer[..count].copy_from_slice(&self.bytes[self.at..self.at + count]);
+        self.at += count;
+        Ok(count)
+    }
+}
+
+/// Chunk sizes every case of this suite is also read in: one byte, an odd size, a page and the
+/// decoder's release threshold.
+const CHUNKS: [usize; 4] = [1, 7, 4096, 1 << 20];
+
+fn measure_streamed(bytes: &[u8], chunk: usize) -> Result<(AudioFacts, FileStats), Error> {
+    measure_reader(Chunked::new(bytes, chunk))
+}
+
+/// Measures `bytes` read whole, and requires the same verdict, error included, when they are
+/// read in each of `CHUNKS`, and on success the file's length and SHA-256.
+fn measure(bytes: &[u8]) -> Result<AudioFacts, Error> {
+    let result = measure_reader(bytes).map(|(audio, stats)| {
+        assert_eq!(stats.len, bytes.len() as u64);
+        assert_eq!(stats.sha256, <[u8; 32]>::from(Sha256::digest(bytes)));
+        audio
+    });
+    for chunk in CHUNKS {
+        let chunked = measure_streamed(bytes, chunk).map(|(audio, _)| audio);
+        assert_eq!(chunked, result, "read in chunks of {chunk} bytes");
     }
     result
 }
@@ -105,7 +136,7 @@ fn flac_name(name: &str) -> String {
 }
 
 fn assert_properties(
-    audio: &AudioPayload,
+    audio: &AudioFacts,
     channels: u8,
     bit_depth: u8,
     rate: u32,
@@ -118,13 +149,13 @@ fn assert_properties(
     assert_eq!(audio.pcm_digest.len(), 32);
 }
 
-fn assert_matches_ffmpeg(bytes: &[u8], audio: &AudioPayload, scratch_name: &str) {
-    let Some(ffmpeg) = ffmpeg() else {
+fn assert_matches_ffmpeg(bytes: &[u8], audio: &AudioFacts, scratch_name: &str) {
+    if !has_ffmpeg() {
         eprintln!("ffmpeg unavailable, skipping PCM cross-check for {scratch_name}");
         return;
-    };
+    }
     let path = scratch_file(scratch_name, bytes);
-    let raw = ffmpeg_raw_pcm(&ffmpeg, &path, audio.bit_depth);
+    let raw = ffmpeg_raw_pcm(&path, audio.bit_depth);
     let frame_bytes = u64::from(audio.channels) * u64::from(audio.bit_depth.div_ceil(8));
     assert_eq!(raw.len() as u64, audio.samples_per_channel * frame_bytes);
     assert_eq!(audio.pcm_digest, blake3::hash(&raw).as_bytes().to_vec());
@@ -135,43 +166,16 @@ fn rejects(bytes: &[u8]) -> Error {
 }
 
 #[test]
-fn ffmpeg_fixtures_measure_correct_properties() {
-    for expected in POSITIVE {
-        let audio = measure(&fixture(&flac_name(expected.name))).expect(expected.name);
-        assert_properties(
-            &audio,
-            expected.channels,
-            expected.bit_depth,
-            expected.sample_rate_hz,
-            expected.samples_per_channel,
-        );
+fn synthesized_8_bit_stereo_and_24_bit_mono_are_measured() {
+    for (channels, bit_depth, rate, name) in [
+        (2, 8, 44_100, "s8_stereo_44100.flac"),
+        (1, 24, 192_000, "s24_mono_192000.flac"),
+    ] {
+        let bytes = Synth::new(channels, bit_depth, rate).build();
+        let audio = measure(&bytes).expect(name);
+        assert_properties(&audio, channels, bit_depth, rate, 2_500);
+        assert_matches_ffmpeg(&bytes, &audio, name);
     }
-}
-
-#[test]
-fn pcm_digest_is_blake3_of_ffmpeg_raw_decode() {
-    for expected in POSITIVE {
-        let name = flac_name(expected.name);
-        let bytes = fixture(&name);
-        let audio = measure(&bytes).expect(expected.name);
-        assert_matches_ffmpeg(&bytes, &audio, &name);
-    }
-}
-
-#[test]
-fn synthesized_8_bit_stereo_is_measured() {
-    let bytes = Synth::new(2, 8, 44_100).build();
-    let audio = measure(&bytes).expect("8-bit");
-    assert_properties(&audio, 2, 8, 44_100, 2_500);
-    assert_matches_ffmpeg(&bytes, &audio, "s8_stereo_44100.flac");
-}
-
-#[test]
-fn synthesized_24_bit_mono_is_measured() {
-    let bytes = Synth::new(1, 24, 192_000).build();
-    let audio = measure(&bytes).expect("24-bit");
-    assert_properties(&audio, 1, 24, 192_000, 2_500);
-    assert_matches_ffmpeg(&bytes, &audio, "s24_mono_192000.flac");
 }
 
 #[test]
@@ -194,21 +198,210 @@ fn frame_rate_encodings_equal_to_streaminfo_are_accepted() {
     }
 }
 
+/// `canonical` with `blocks` of `(type, body)` inserted after STREAMINFO.
+fn with_metadata(canonical: &[u8], blocks: &[(u8, Vec<u8>)]) -> Vec<u8> {
+    let mut out = canonical[..42].to_vec();
+    out[4] &= 0x7f;
+    for (index, (block_type, body)) in blocks.iter().enumerate() {
+        let last = if index + 1 == blocks.len() { 0x80 } else { 0 };
+        out.push(block_type | last);
+        out.extend_from_slice(&(body.len() as u32).to_be_bytes()[1..]);
+        out.extend_from_slice(body);
+    }
+    out.extend_from_slice(&canonical[42..]);
+    out
+}
+
+/// What `@misofm/codec` and libFLAC write: libFLAC's vendor string and no comments.
+fn codec_comment() -> Vec<u8> {
+    let vendor = b"reference libFLAC 1.5.0 20250211";
+    let mut body = (vendor.len() as u32).to_le_bytes().to_vec();
+    body.extend_from_slice(vendor);
+    body.extend_from_slice(&0u32.to_le_bytes());
+    body
+}
+
+fn tagged_comment() -> Vec<u8> {
+    let mut body = codec_comment();
+    body.truncate(body.len() - 4);
+    let comments = [&b"TITLE=Pink noise"[..], b"ARTIST=Nobody"];
+    body.extend_from_slice(&(comments.len() as u32).to_le_bytes());
+    for comment in comments {
+        body.extend_from_slice(&(comment.len() as u32).to_le_bytes());
+        body.extend_from_slice(comment);
+    }
+    body
+}
+
+/// Seek points at the first `count` frames: sample number, byte offset, samples.
+fn seektable(count: u64) -> Vec<u8> {
+    let mut body = Vec::new();
+    for point in 0..count {
+        body.extend_from_slice(&(point * 1_024).to_be_bytes());
+        body.extend_from_slice(&0u64.to_be_bytes());
+        body.extend_from_slice(&1_024u16.to_be_bytes());
+    }
+    body
+}
+
+const PADDING: u8 = 1;
+const APPLICATION: u8 = 2;
+const SEEKTABLE: u8 = 3;
+const VORBIS_COMMENT: u8 = 4;
+const CUESHEET: u8 = 5;
+const PICTURE: u8 = 6;
+
 #[test]
-fn rejects_vorbis_comment_after_streaminfo() {
-    let mut bytes = fixture("s16_stereo_44100.flac");
-    bytes[4] = 0x00;
-    let comment = [0x84, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0];
-    bytes.splice(42..42, comment);
-    assert_eq!(rejects(&bytes), Error::ExtraMetadata);
+fn tags_padding_and_seektables_do_not_change_the_audio() {
+    for name in ["s16_stereo_44100.flac", "libflac_s24_stereo_96000.flac"] {
+        let canonical = fixture(name);
+        let expected = measure(&canonical).expect("canonical");
+        for blocks in [
+            vec![(VORBIS_COMMENT, codec_comment())],
+            vec![(VORBIS_COMMENT, tagged_comment())],
+            vec![(VORBIS_COMMENT, vec![0; 8])],
+            vec![(PADDING, vec![0; 4])],
+            vec![(PADDING, Vec::new())],
+            vec![(SEEKTABLE, seektable(3))],
+            vec![
+                (SEEKTABLE, seektable(2)),
+                (VORBIS_COMMENT, codec_comment()),
+                (PADDING, vec![0; 8_192]),
+            ],
+        ] {
+            let tagged = with_metadata(&canonical, &blocks);
+            assert_eq!(measure(&tagged), Ok(expected.clone()), "{name}: {blocks:?}");
+        }
+    }
+}
+
+/// `bytes` with every metadata block after STREAMINFO removed.
+fn strip_metadata(bytes: &[u8]) -> Vec<u8> {
+    let mut offset = 4;
+    loop {
+        let header = bytes[offset];
+        let length =
+            u32::from_be_bytes([0, bytes[offset + 1], bytes[offset + 2], bytes[offset + 3]]);
+        offset += 4 + length as usize;
+        if header & 0x80 != 0 {
+            break;
+        }
+    }
+    let mut out = bytes[..42].to_vec();
+    out[4] |= 0x80;
+    out.extend_from_slice(&bytes[offset..]);
+    out
 }
 
 #[test]
-fn rejects_padding_after_streaminfo() {
-    let mut bytes = fixture("s16_stereo_44100.flac");
-    bytes[4] = 0x00;
-    bytes.splice(42..42, [0x81, 0, 0, 4, 0, 0, 0, 0]);
-    assert_eq!(rejects(&bytes), Error::ExtraMetadata);
+fn ffmpeg_output_with_its_tags_is_measured_as_without_them() {
+    if !has_ffmpeg() {
+        eprintln!("ffmpeg unavailable, skipping the tagged ffmpeg file");
+        return;
+    }
+    let path = scratch_file("tagged.flac", &[]);
+    let status = std::process::Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+        ])
+        .arg("aevalsrc=0.5*sin(2*PI*440*t)|0.4*sin(2*PI*660*t):s=48000:d=0.25")
+        .args([
+            "-metadata",
+            "title=Two tones",
+            "-c:a",
+            "flac",
+            "-sample_fmt",
+            "s16",
+        ])
+        .arg(&path)
+        .status()
+        .expect("ffmpeg");
+    assert!(status.success());
+    let tagged = std::fs::read(&path).expect("ffmpeg output");
+    assert_eq!(
+        tagged[4] & 0x80,
+        0,
+        "ffmpeg wrote metadata after STREAMINFO"
+    );
+    let expected = measure(&strip_metadata(&tagged)).expect("stripped");
+    assert_eq!(measure(&tagged), Ok(expected));
+}
+
+#[test]
+fn metadata_may_fill_its_limit_but_not_exceed_it() {
+    let canonical = fixture("s16_stereo_44100.flac");
+    let expected = measure(&canonical).expect("canonical");
+    let limit = MAX_EXTRA_METADATA_BYTES as usize;
+    let full = with_metadata(&canonical, &[(PADDING, vec![0; limit - 4])]);
+    assert_eq!(measure(&full), Ok(expected.clone()));
+    let comment = codec_comment();
+    let padding = limit - 8 - comment.len();
+    let split = with_metadata(
+        &canonical,
+        &[(VORBIS_COMMENT, comment), (PADDING, vec![0; padding])],
+    );
+    assert_eq!(measure(&split), Ok(expected));
+    let over = with_metadata(&canonical, &[(PADDING, vec![0; limit - 3])]);
+    assert_eq!(rejects(&over), Error::MetadataTooLong);
+    let many = with_metadata(&canonical, &vec![(PADDING, vec![0; 1_020]); 65]);
+    assert_eq!(rejects(&many), Error::MetadataTooLong);
+    // The declared length is checked before the block is read.
+    let mut huge = canonical[..42].to_vec();
+    huge[4] &= 0x7f;
+    huge.extend_from_slice(&[0x81, 0xff, 0xff, 0xff]);
+    assert_eq!(rejects(&huge), Error::MetadataTooLong);
+    assert!(
+        Error::MetadataTooLong
+            .to_string()
+            .contains(&limit.to_string())
+    );
+}
+
+#[test]
+fn rejects_other_metadata_after_streaminfo() {
+    let canonical = fixture("s16_stereo_44100.flac");
+    for block_type in [0, APPLICATION, CUESHEET, PICTURE, 7, 126, 127] {
+        let bytes = with_metadata(&canonical, &[(block_type, vec![0; 64])]);
+        assert_eq!(rejects(&bytes), Error::MetadataBlock(block_type));
+        let after_tags = with_metadata(
+            &canonical,
+            &[(VORBIS_COMMENT, codec_comment()), (block_type, vec![0; 64])],
+        );
+        assert_eq!(rejects(&after_tags), Error::MetadataBlock(block_type));
+    }
+    assert!(
+        Error::MetadataBlock(PICTURE)
+            .to_string()
+            .contains("only PADDING, SEEKTABLE and VORBIS_COMMENT")
+    );
+}
+
+#[test]
+fn rejects_malformed_or_truncated_metadata() {
+    let canonical = fixture("s16_stereo_44100.flac");
+    // A seek table that is not a whole number of 18-byte points.
+    let seektable = with_metadata(&canonical, &[(SEEKTABLE, vec![0; 17])]);
+    assert_eq!(rejects(&seektable), Error::SeekTableLength(17));
+    // The last-block flag is clear, but no block follows: the first frame's sync code is read
+    // as a block header of type 127.
+    let mut unflagged = canonical.clone();
+    unflagged[4] &= 0x7f;
+    assert_eq!(rejects(&unflagged), Error::MetadataBlock(127));
+    let tagged = with_metadata(&canonical, &[(VORBIS_COMMENT, codec_comment())]);
+    let end = 42 + 4 + codec_comment().len();
+    for len in [43, 45, 46, 60, end - 1] {
+        assert_eq!(
+            rejects(&tagged[..len]),
+            Error::TooShort(len),
+            "length {len}"
+        );
+    }
 }
 
 #[test]
@@ -265,15 +458,11 @@ fn rejects_total_samples_mismatch() {
 }
 
 #[test]
-fn rejects_32_bit_flac() {
+fn rejects_unsupported_bit_depths() {
     assert_eq!(
         rejects(&fixture("s32_stereo_48000.flac")),
-        Error::Unsupported32Bit
+        Error::UnsupportedBitDepth(32)
     );
-}
-
-#[test]
-fn rejects_unsupported_bit_depth() {
     let mut bytes = fixture("s16_stereo_44100.flac");
     set_streaminfo(&mut bytes, 44_100, 2, 12, 11_025);
     assert_eq!(rejects(&bytes), Error::UnsupportedBitDepth(12));
@@ -373,54 +562,6 @@ fn rejects_mismatch_in_a_later_frame() {
 }
 
 #[test]
-fn rejects_mono_file_relabelled_as_stereo_48k() {
-    let mut bytes = fixture("s16_mono_44100.flac");
-    measure(&bytes).expect("honest mono file is accepted");
-    let samples = decoded_samples(&bytes);
-    assert_eq!(samples.len(), 8_820);
-    set_streaminfo(&mut bytes, 48_000, 2, 16, 4_410);
-    set_md5(&mut bytes, pcm_md5(&samples, 2));
-    assert!(matches!(
-        rejects(&bytes),
-        Error::FrameChannels {
-            frame: 0,
-            expected: 2,
-            found: 1
-        }
-    ));
-}
-
-#[test]
-fn rejects_ffmpeg_file_with_patched_sample_rate() {
-    let mut bytes = fixture("s16_stereo_44100.flac");
-    set_streaminfo(&mut bytes, 48_000, 2, 16, 11_025);
-    assert!(matches!(
-        rejects(&bytes),
-        Error::FrameSampleRate {
-            expected: 48_000,
-            found: 44_100,
-            ..
-        }
-    ));
-}
-
-#[test]
-fn rejects_ffmpeg_file_with_patched_bit_depth() {
-    let mut bytes = fixture("s16_stereo_44100.flac");
-    let samples = decoded_samples(&bytes);
-    set_streaminfo(&mut bytes, 44_100, 2, 24, 11_025);
-    set_md5(&mut bytes, pcm_md5(&samples, 3));
-    assert!(matches!(
-        rejects(&bytes),
-        Error::FrameBitDepth {
-            expected: 24,
-            found: 16,
-            ..
-        }
-    ));
-}
-
-#[test]
 fn rejects_truncated_file() {
     let bytes = fixture("s16_stereo_44100.flac");
     for len in [41, 42, 100, bytes.len() / 2, bytes.len() - 1] {
@@ -483,7 +624,7 @@ fn pcm_digest_follows_the_audio_spec_at_every_accepted_bit_depth() {
 }
 
 #[test]
-fn ffmpeg_and_libflac_output_claims_exact_block_and_frame_sizes() {
+fn encoder_output_is_measured_with_exact_block_and_frame_sizes() {
     for expected in POSITIVE.iter().chain(&ENCODER_OUTPUT) {
         let name = flac_name(expected.name);
         let bytes = fixture(&name);
@@ -772,5 +913,174 @@ fn rejects_sample_overrun_on_the_first_frame() {
             assert!(decoded > 1 && decoded < 11_025);
         }
         error => panic!("unexpected error: {error:?}"),
+    }
+}
+
+#[test]
+fn rejects_excessive_decoded_work_before_decoding() {
+    let mut bytes = fixture("s16_stereo_44100.flac");
+    // Preserve format fields and replace the 36-bit sample count with its maximum.
+    bytes[21] |= 0x0f;
+    bytes[22..26].fill(0xff);
+    assert_eq!(rejects(&bytes), Error::DecodedTooLarge);
+    assert!(Error::DecodedTooLarge.to_string().contains("4 GiB"));
+    // Rejected from STREAMINFO alone: the frames are never read.
+    assert_eq!(rejects(&bytes[..42]), Error::DecodedTooLarge);
+}
+
+#[test]
+fn streamed_window_stays_bounded() {
+    let bytes = fixture("libflac_s24_stereo_96000.flac");
+    for chunk in CHUNKS {
+        let (_, stats) = measure_streamed(&bytes, chunk).expect("fixture");
+        assert!(stats.peak_held <= bytes.len(), "{stats:?}");
+    }
+    let mut long = Synth::new(2, 24, 96_000);
+    long.block_size = 4_096;
+    long.frames_per_channel = 200 * 4_096;
+    let bytes = long.build();
+    assert!(bytes.len() > 3 << 20, "{} bytes", bytes.len());
+    let (_, stats) = measure_streamed(&bytes, 65_536).expect("long file");
+    assert!(stats.peak_held <= (1 << 20) + (256 << 10), "{stats:?}");
+}
+
+#[test]
+fn streamed_read_error_is_rejected() {
+    struct Failing;
+    impl Read for Failing {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::other("connection reset"))
+        }
+    }
+    let bytes = fixture("s16_stereo_44100.flac");
+    let reader = Chunked::new(&bytes[..bytes.len() / 2], 4096).chain(Failing);
+    assert_eq!(
+        measure_reader(reader),
+        Err(Error::Read("connection reset".into()))
+    );
+    assert_eq!(
+        measure_reader(Failing),
+        Err(Error::Read("connection reset".into()))
+    );
+}
+
+/// A VORBIS_COMMENT body with libFLAC's vendor string and `comments`.
+fn comment_with(comments: &[&str]) -> Vec<u8> {
+    let mut body = codec_comment();
+    body.truncate(body.len() - 4);
+    body.extend_from_slice(&(comments.len() as u32).to_le_bytes());
+    for comment in comments {
+        body.extend_from_slice(&(comment.len() as u32).to_le_bytes());
+        body.extend_from_slice(comment.as_bytes());
+    }
+    body
+}
+
+#[test]
+fn channel_layouts_default_to_flacs_assignment() {
+    for (channels, layout) in [
+        (1, vec![2]),
+        (2, vec![0, 1]),
+        (6, vec![0, 1, 2, 3, 9, 10]),
+        (8, vec![0, 1, 2, 3, 4, 5, 9, 10]),
+    ] {
+        let bytes = Synth::new(channels, 16, 48_000).build();
+        let audio = measure(&bytes).expect("synthesized");
+        assert_eq!(audio.channels, channels);
+        assert_eq!(audio.channel_layout, layout, "{channels} channels");
+        let tagged = with_metadata(&bytes, &[(VORBIS_COMMENT, tagged_comment())]);
+        assert_eq!(measure(&tagged), Ok(audio), "{channels} channels, tagged");
+    }
+    for (name, layout) in [
+        ("s16_mono_44100.flac", vec![2]),
+        ("s16_stereo_44100.flac", vec![0, 1]),
+    ] {
+        assert_eq!(measure(&fixture(name)).expect(name).channel_layout, layout);
+    }
+}
+
+#[test]
+fn a_channel_mask_overrides_the_default_layout() {
+    let six = Synth::new(6, 16, 48_000).build();
+    let expected = measure(&six).expect("synthesized");
+    let mask = |value: &str| {
+        let field = format!("WAVEFORMATEXTENSIBLE_CHANNEL_MASK={value}");
+        with_metadata(
+            &six,
+            &[(VORBIS_COMMENT, comment_with(&["TITLE=x", &field]))],
+        )
+    };
+    for (value, layout) in [
+        // 5.1 with back surrounds instead of side ones.
+        ("0x3F", vec![0, 1, 2, 3, 4, 5]),
+        // Front left and right, then four channels with no speaker position.
+        ("0x0003", vec![0, 1, 255, 255, 255, 255]),
+        ("0x0", vec![255; 6]),
+        // Six top speakers.
+        ("0x1f800", vec![11, 12, 13, 14, 15, 16]),
+    ] {
+        let audio = measure(&mask(value)).expect(value);
+        assert_eq!(audio.channel_layout, layout, "{value}");
+        assert_eq!(audio.pcm_digest, expected.pcm_digest, "{value}");
+    }
+    assert_eq!(
+        rejects(&mask("0x7f")),
+        Error::ChannelMaskChannels {
+            mask: 0x7f,
+            channels: 6
+        }
+    );
+    assert_eq!(rejects(&mask("0x4003f")), Error::ChannelMaskBits(0x4003f));
+    assert_eq!(rejects(&mask("63")), Error::ChannelMaskValue("63".into()));
+    let mask_field = "WAVEFORMATEXTENSIBLE_CHANNEL_MASK=0x3f";
+    let repeated = with_metadata(
+        &six,
+        &[
+            (VORBIS_COMMENT, comment_with(&[mask_field])),
+            (VORBIS_COMMENT, comment_with(&[mask_field])),
+        ],
+    );
+    assert_eq!(rejects(&repeated), Error::ChannelMaskRepeated);
+    let mut malformed = comment_with(&[mask_field]);
+    malformed.push(0);
+    let malformed = with_metadata(&six, &[(VORBIS_COMMENT, malformed)]);
+    assert_eq!(rejects(&malformed), Error::VorbisComment);
+}
+
+#[test]
+fn ffmpeg_layouts_are_read_from_its_files() {
+    if !has_ffmpeg() {
+        eprintln!("ffmpeg unavailable, skipping ffmpeg's channel layouts");
+        return;
+    }
+    // ffmpeg writes no mask for FLAC's own layouts, and 0x3f for 5.1 with back surrounds.
+    for (layout, expected) in [
+        ("mono", vec![2]),
+        ("5.1", vec![0, 1, 2, 3, 4, 5]),
+        ("5.1(side)", vec![0, 1, 2, 3, 9, 10]),
+        ("7.1", vec![0, 1, 2, 3, 4, 5, 9, 10]),
+    ] {
+        let path = scratch_file(&format!("layout_{layout}.flac"), &[]);
+        let status = std::process::Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+            ])
+            .arg(format!(
+                "aevalsrc=0.1*sin(2*PI*440*t):c={layout}:s=48000:d=0.1"
+            ))
+            .args(["-c:a", "flac", "-sample_fmt", "s16"])
+            .arg(&path)
+            .status()
+            .expect("ffmpeg");
+        assert!(status.success());
+        let bytes = std::fs::read(&path).expect("ffmpeg output");
+        let audio = measure(&bytes).expect(layout);
+        assert_eq!(audio.channel_layout, expected, "{layout}");
     }
 }

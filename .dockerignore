@@ -1,5 +1,5 @@
 .git
 target
 out
-crates/*/target
-move
+host/gateway/target
+interop/out
