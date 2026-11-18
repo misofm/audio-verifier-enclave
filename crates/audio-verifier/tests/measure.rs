@@ -2,7 +2,7 @@ mod common;
 
 use std::io::{self, Read};
 
-use audio_verifier::{AudioPayload, Error, FileStats, MAX_EXTRA_METADATA_BYTES, measure_reader};
+use audio_verifier::{AudioFacts, Error, FileStats, MAX_EXTRA_METADATA_BYTES, measure_reader};
 use common::{
     FrameEdit, FrameHeader, Rate, Synth, block_sizes, decoded_samples, ffmpeg_raw_pcm, fixture,
     frame_sizes, has_ffmpeg, scratch_file, set_block_sizes, set_frame_sizes, set_md5,
@@ -40,13 +40,13 @@ impl Read for Chunked<'_> {
 /// decoder's release threshold.
 const CHUNKS: [usize; 4] = [1, 7, 4096, 1 << 20];
 
-fn measure_streamed(bytes: &[u8], chunk: usize) -> Result<(AudioPayload, FileStats), Error> {
+fn measure_streamed(bytes: &[u8], chunk: usize) -> Result<(AudioFacts, FileStats), Error> {
     measure_reader(Chunked::new(bytes, chunk))
 }
 
 /// Measures `bytes` read whole, and requires the same verdict, error included, when they are
 /// read in each of `CHUNKS`, and on success the file's length and SHA-256.
-fn measure(bytes: &[u8]) -> Result<AudioPayload, Error> {
+fn measure(bytes: &[u8]) -> Result<AudioFacts, Error> {
     let result = measure_reader(bytes).map(|(audio, stats)| {
         assert_eq!(stats.len, bytes.len() as u64);
         assert_eq!(stats.sha256, <[u8; 32]>::from(Sha256::digest(bytes)));
@@ -136,7 +136,7 @@ fn flac_name(name: &str) -> String {
 }
 
 fn assert_properties(
-    audio: &AudioPayload,
+    audio: &AudioFacts,
     channels: u8,
     bit_depth: u8,
     rate: u32,
@@ -149,7 +149,7 @@ fn assert_properties(
     assert_eq!(audio.pcm_digest.len(), 32);
 }
 
-fn assert_matches_ffmpeg(bytes: &[u8], audio: &AudioPayload, scratch_name: &str) {
+fn assert_matches_ffmpeg(bytes: &[u8], audio: &AudioFacts, scratch_name: &str) {
     if !has_ffmpeg() {
         eprintln!("ffmpeg unavailable, skipping PCM cross-check for {scratch_name}");
         return;
@@ -962,4 +962,125 @@ fn streamed_read_error_is_rejected() {
         measure_reader(Failing),
         Err(Error::Read("connection reset".into()))
     );
+}
+
+/// A VORBIS_COMMENT body with libFLAC's vendor string and `comments`.
+fn comment_with(comments: &[&str]) -> Vec<u8> {
+    let mut body = codec_comment();
+    body.truncate(body.len() - 4);
+    body.extend_from_slice(&(comments.len() as u32).to_le_bytes());
+    for comment in comments {
+        body.extend_from_slice(&(comment.len() as u32).to_le_bytes());
+        body.extend_from_slice(comment.as_bytes());
+    }
+    body
+}
+
+#[test]
+fn channel_layouts_default_to_flacs_assignment() {
+    for (channels, layout) in [
+        (1, vec![2]),
+        (2, vec![0, 1]),
+        (6, vec![0, 1, 2, 3, 9, 10]),
+        (8, vec![0, 1, 2, 3, 4, 5, 9, 10]),
+    ] {
+        let bytes = Synth::new(channels, 16, 48_000).build();
+        let audio = measure(&bytes).expect("synthesized");
+        assert_eq!(audio.channels, channels);
+        assert_eq!(audio.channel_layout, layout, "{channels} channels");
+        let tagged = with_metadata(&bytes, &[(VORBIS_COMMENT, tagged_comment())]);
+        assert_eq!(measure(&tagged), Ok(audio), "{channels} channels, tagged");
+    }
+    for (name, layout) in [
+        ("s16_mono_44100.flac", vec![2]),
+        ("s16_stereo_44100.flac", vec![0, 1]),
+    ] {
+        assert_eq!(measure(&fixture(name)).expect(name).channel_layout, layout);
+    }
+}
+
+#[test]
+fn a_channel_mask_overrides_the_default_layout() {
+    let six = Synth::new(6, 16, 48_000).build();
+    let expected = measure(&six).expect("synthesized");
+    let mask = |value: &str| {
+        let field = format!("WAVEFORMATEXTENSIBLE_CHANNEL_MASK={value}");
+        with_metadata(
+            &six,
+            &[(VORBIS_COMMENT, comment_with(&["TITLE=x", &field]))],
+        )
+    };
+    for (value, layout) in [
+        // 5.1 with back surrounds instead of side ones.
+        ("0x3F", vec![0, 1, 2, 3, 4, 5]),
+        // Front left and right, then four channels with no speaker position.
+        ("0x0003", vec![0, 1, 255, 255, 255, 255]),
+        ("0x0", vec![255; 6]),
+        // Six top speakers.
+        ("0x1f800", vec![11, 12, 13, 14, 15, 16]),
+    ] {
+        let audio = measure(&mask(value)).expect(value);
+        assert_eq!(audio.channel_layout, layout, "{value}");
+        assert_eq!(audio.pcm_digest, expected.pcm_digest, "{value}");
+    }
+    assert_eq!(
+        rejects(&mask("0x7f")),
+        Error::ChannelMaskChannels {
+            mask: 0x7f,
+            channels: 6
+        }
+    );
+    assert_eq!(rejects(&mask("0x4003f")), Error::ChannelMaskBits(0x4003f));
+    assert_eq!(rejects(&mask("63")), Error::ChannelMaskValue("63".into()));
+    let mask_field = "WAVEFORMATEXTENSIBLE_CHANNEL_MASK=0x3f";
+    let repeated = with_metadata(
+        &six,
+        &[
+            (VORBIS_COMMENT, comment_with(&[mask_field])),
+            (VORBIS_COMMENT, comment_with(&[mask_field])),
+        ],
+    );
+    assert_eq!(rejects(&repeated), Error::ChannelMaskRepeated);
+    let mut malformed = comment_with(&[mask_field]);
+    malformed.push(0);
+    let malformed = with_metadata(&six, &[(VORBIS_COMMENT, malformed)]);
+    assert_eq!(rejects(&malformed), Error::VorbisComment);
+}
+
+#[test]
+fn ffmpeg_layouts_are_read_from_its_files() {
+    if !has_ffmpeg() {
+        eprintln!("ffmpeg unavailable, skipping ffmpeg's channel layouts");
+        return;
+    }
+    // ffmpeg writes no mask for FLAC's own layouts, and 0x3f for 5.1 with back surrounds.
+    for (layout, expected) in [
+        ("mono", vec![2]),
+        ("5.1", vec![0, 1, 2, 3, 4, 5]),
+        ("5.1(side)", vec![0, 1, 2, 3, 9, 10]),
+        ("7.1", vec![0, 1, 2, 3, 4, 5, 9, 10]),
+    ] {
+        let path = scratch_file(&format!("layout_{layout}.flac"), &[]);
+        let status = std::process::Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+            ])
+            .arg(format!(
+                "aevalsrc=0.1*sin(2*PI*440*t):c={layout}:s=48000:d=0.1"
+            ))
+            .args(["-c:a", "flac", "-sample_fmt", "s16"])
+            .arg(&path)
+            .status()
+            .expect("ffmpeg");
+        assert!(status.success());
+        let bytes = std::fs::read(&path).expect("ffmpeg output");
+        let audio = measure(&bytes).expect(layout);
+        assert_eq!(audio.channel_layout, expected, "{layout}");
+    }
 }

@@ -1,11 +1,13 @@
 //! The service's router: `POST /measure`, `POST /attest` and `GET /health`. Nautilus's own
 //! router is not used: it always mounts `/process_data`, and it buffers bodies whole.
 
+pub mod master;
 mod measure;
+pub mod tink;
 
 use std::{sync::Arc, time::Duration};
 
-use audio_verifier::{AudioPayload, FileStats};
+use audio_verifier::{AudioFacts, FileStats};
 use axum::{
     Json, Router,
     extract::{Request, State},
@@ -20,6 +22,10 @@ use nautilus::{
 };
 use serde::{Deserialize, Serialize};
 use tokio::{sync::Semaphore, task::spawn_blocking, time::timeout};
+use walrus_core::BlobId;
+
+pub use master::{Pins, identity, u256_le_decimal};
+pub use measure::MEASURED_MASTER_TYPE;
 
 /// Intent of the signed `IntentMessage<AudioPayload>`, verified on chain by
 /// `audio_verifier::verify_audio`.
@@ -32,7 +38,7 @@ pub const MASTER_FILE_INTENT: Intent = Intent(2);
 /// Largest file `/measure` accepts.
 pub const MAX_FILE_BYTES: u64 = 256 << 20;
 
-/// Worst-case memory of one `/measure` job, rounded up from its parts:
+/// Worst-case memory of decoding one `/measure` file, rounded up from its parts:
 ///
 /// - the decoder's window: at most 16 MiB + 128 KiB past the last complete frame, one more
 ///   8 KiB read and 1 MiB of finished frames, in one allocation that is never copied, 17.2 MiB;
@@ -42,7 +48,14 @@ pub const MAX_FILE_BYTES: u64 = 256 << 20;
 /// - the body queue: 16 queued chunks, the one being read and the one being sent, each at most
 ///   hyper's ~408 KiB read buffer, about 7.3 MiB;
 /// - the metadata (64 KiB), two thread stacks and the response.
-pub const MEASURE_JOB_BYTES: u64 = 48 << 20;
+pub const DECODE_JOB_BYTES: u64 = 48 << 20;
+
+/// Worst-case memory of one `/measure` job. Its ciphertext, at most [`MAX_FILE_BYTES`] and 4 KiB
+/// of tags, is held from the first byte until the response is sent. Decoding comes first, then
+/// walrus-core's blob ID, which holds the 666 non-systematic secondary slivers (about half the
+/// ciphertext) and 1,000 by 1,000 33-byte symbol hashes (33 MB) besides it; the decoder's memory
+/// is free by then. `tests/memory_master.rs` measures a 256 MiB file's job.
+pub const MEASURE_JOB_BYTES: u64 = 512 << 20;
 
 /// Memory kept for everything but the jobs: the kernel's own allocations, the root file system
 /// the image unpacks into memory, the runtime, and up to 256 connections, each with at most a
@@ -64,6 +77,9 @@ pub struct Limits {
     pub chunk_timeout: Duration,
     /// Deadline for the whole request, body and measurement: 256 MiB at about 0.5 MB/s.
     pub request_timeout: Duration,
+    /// Deadline for sending the ciphertext once the response has started; a reader that takes
+    /// nothing for [`Limits::chunk_timeout`] is also abandoned.
+    pub response_timeout: Duration,
 }
 
 impl Limits {
@@ -73,8 +89,22 @@ impl Limits {
             jobs,
             chunk_timeout: Duration::from_secs(30),
             request_timeout: Duration::from_secs(600),
+            response_timeout: Duration::from_secs(600),
         }
     }
+}
+
+/// Checks the decoder, the Tink encryption, the Walrus blob ID and the pinned Seal key against
+/// recorded answers, so that a build that computes wrongly on this CPU refuses to start.
+pub fn self_test() -> Result<(), String> {
+    audio_verifier::self_test().map_err(|error| error.to_string())?;
+    tink::self_test()?;
+    let pins = Pins::pinned();
+    let (name, bytes, expected) = master::KNOWN_BLOB_IDS[0];
+    if pins.blob_id(bytes)?.to_string() != expected {
+        return Err(format!("self-test failed: blob ID of {name}"));
+    }
+    Ok(())
 }
 
 /// `/measure` jobs for an enclave with `cpus` vCPUs and `mem_total` bytes of `MemTotal`: one per
@@ -97,6 +127,46 @@ pub fn mem_total(meminfo: &str) -> Option<u64> {
     kib.ok()?.checked_mul(1024)
 }
 
+/// BCS mirror of the Move `audio_verifier::audio_verifier::AudioPayload`, field for field: the
+/// facts of the decoded audio, its channel layout, and the encrypted master's blob ID and sealed
+/// DEK, signed under [`AUDIO_INTENT`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AudioPayload {
+    /// Channel count.
+    pub channels: u8,
+    /// Bits per sample.
+    pub bit_depth: u8,
+    /// Sample rate in hertz.
+    pub sample_rate_hz: u32,
+    /// Samples per channel.
+    pub samples_per_channel: u64,
+    /// BLAKE3 of the decoded PCM.
+    pub pcm_digest: Vec<u8>,
+    /// One speaker position per channel.
+    pub channel_layout: Vec<u8>,
+    /// Walrus blob ID of the encrypted file: the 32 bytes of the BCS `u256`, little-endian,
+    /// which are also Walrus's own blob ID bytes.
+    pub blob_id: [u8; 32],
+    /// BCS of the Seal `EncryptedObject` of the DEK.
+    pub sealed_dek: Vec<u8>,
+}
+
+impl AudioPayload {
+    /// The payload of `facts`, encrypted to `blob_id` with `sealed_dek`.
+    pub fn new(facts: AudioFacts, blob_id: [u8; 32], sealed_dek: Vec<u8>) -> Self {
+        Self {
+            channels: facts.channels,
+            bit_depth: facts.bit_depth,
+            sample_rate_hz: facts.sample_rate_hz,
+            samples_per_channel: facts.samples_per_channel,
+            pcm_digest: facts.pcm_digest,
+            channel_layout: facts.channel_layout,
+            blob_id,
+            sealed_dek,
+        }
+    }
+}
+
 /// JSON view of an `AudioPayload`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AudioJson {
@@ -110,6 +180,14 @@ pub struct AudioJson {
     pub samples_per_channel: String,
     /// BLAKE3 PCM digest as hex.
     pub pcm_digest: String,
+    /// One speaker position per channel.
+    pub channel_layout: Vec<u8>,
+    /// Walrus blob ID as Walrus prints it: URL-safe base64 of its bytes, without padding.
+    pub blob_id: String,
+    /// The same blob ID as the decimal `u256` that `verify_audio` takes.
+    pub blob_id_u256: String,
+    /// Seal `EncryptedObject` of the DEK, as hex.
+    pub sealed_dek: String,
 }
 
 impl From<&AudioPayload> for AudioJson {
@@ -120,6 +198,10 @@ impl From<&AudioPayload> for AudioJson {
             sample_rate_hz: audio.sample_rate_hz,
             samples_per_channel: audio.samples_per_channel.to_string(),
             pcm_digest: hex::encode(&audio.pcm_digest),
+            channel_layout: audio.channel_layout.clone(),
+            blob_id: BlobId(audio.blob_id).to_string(),
+            blob_id_u256: u256_le_decimal(&audio.blob_id),
+            sealed_dek: hex::encode(&audio.sealed_dek),
         }
     }
 }
@@ -149,11 +231,11 @@ impl<T> SignedJson<T> {
     }
 }
 
-/// BCS layout of the file binding signed under [`MASTER_FILE_INTENT`]: the audio facts, as
-/// signed under [`AUDIO_INTENT`], and the size and SHA-256 of the exact bytes measured.
+/// BCS layout of the file binding signed under [`MASTER_FILE_INTENT`]: the payload signed under
+/// [`AUDIO_INTENT`], and the size and SHA-256 of the exact plaintext bytes measured.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MasterFilePayload {
-    /// The audio facts.
+    /// The audio payload.
     pub audio: AudioPayload,
     /// Bytes of the file.
     pub file_size: u64,
@@ -170,24 +252,28 @@ pub struct FileJson {
     pub file_sha256: String,
 }
 
-/// `/measure` response body: the audio facts and the file binding, signed with one timestamp.
+/// The JSON that starts a `/measure` response: the payload and the file binding, signed with
+/// one timestamp, and the size of the ciphertext that follows it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MeasureResponse {
-    /// The audio facts, for `verify_audio`.
+    /// The audio payload, for `verify_audio`.
     pub audio: SignedJson<AudioJson>,
     /// The file binding, for off-chain verifiers.
     pub master_file: SignedJson<FileJson>,
+    /// Bytes of the ciphertext, as a decimal string.
+    pub ciphertext_size: String,
     /// Enclave Ed25519 public key as hex.
     pub public_key: String,
 }
 
-/// Signs the audio facts under [`AUDIO_INTENT`] and the file binding under
-/// [`MASTER_FILE_INTENT`], both with `timestamp`, one reading of the enclave clock.
+/// Signs the payload under [`AUDIO_INTENT`] and the file binding under [`MASTER_FILE_INTENT`],
+/// both with `timestamp`, one reading of the enclave clock.
 pub fn sign_measurement(
     ctx: &NautilusContext,
     timestamp: Timestamp,
     audio: AudioPayload,
     file: &FileStats,
+    ciphertext_size: u64,
 ) -> Result<MeasureResponse, NautilusError> {
     let audio_json = AudioJson::from(&audio);
     let binding = MasterFilePayload {
@@ -204,21 +290,30 @@ pub fn sign_measurement(
     Ok(MeasureResponse {
         audio: SignedJson::new(audio, audio_json),
         master_file: SignedJson::new(binding, file),
+        ciphertext_size: ciphertext_size.to_string(),
         public_key: ctx.public_key_hex(),
     })
 }
 
 struct Service {
     ctx: NautilusContext,
+    pins: Arc<Pins>,
     limits: Limits,
     measure_permits: Arc<Semaphore>,
     attest_permit: Arc<Semaphore>,
 }
 
-/// Builds the service's router around an injected context. `/attest` runs one at a time.
+/// Builds the service's router around an injected context, with the image's [`Pins`].
+/// `/attest` runs one at a time.
 pub fn app(ctx: NautilusContext, limits: Limits) -> Router {
+    app_with_pins(ctx, limits, Pins::pinned())
+}
+
+/// [`app`] with other pins, for tests.
+pub fn app_with_pins(ctx: NautilusContext, limits: Limits, pins: Pins) -> Router {
     let service = Service {
         ctx,
+        pins: Arc::new(pins),
         limits,
         measure_permits: Arc::new(Semaphore::new(limits.jobs)),
         attest_permit: Arc::new(Semaphore::new(1)),
@@ -353,9 +448,9 @@ mod tests {
     fn jobs_follow_the_vcpus_unless_memory_is_short() {
         assert_eq!(measure_jobs(2, Some(1900 * MIB)), 2);
         assert_eq!(measure_jobs(4, Some(6144 * MIB)), 4);
-        assert_eq!(measure_jobs(32, Some(1024 * MIB)), 18);
-        assert_eq!(measure_jobs(64, Some((128 + 48 * 10 - 1) * MIB)), 9);
-        assert_eq!(measure_jobs(64, Some((128 + 48 * 10) * MIB)), 10);
+        assert_eq!(measure_jobs(32, Some(6144 * MIB)), 11);
+        assert_eq!(measure_jobs(64, Some((128 + 512 * 10 - 1) * MIB)), 9);
+        assert_eq!(measure_jobs(64, Some((128 + 512 * 10) * MIB)), 10);
         assert_eq!(measure_jobs(8, Some(100 * MIB)), 1);
         assert_eq!(measure_jobs(32, None), 1);
     }

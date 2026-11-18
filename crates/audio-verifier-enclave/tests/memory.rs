@@ -1,10 +1,11 @@
 //! Two concurrent 256 MiB bodies, each one frame that never ends, through the real router: each
-//! job stops after its window, so together they cost tens of MiB rather than 512. This test is
-//! alone in its binary, so the process's peak RSS is its own.
+//! job stops after its window, so together they cost tens of MiB rather than 512, the
+//! ciphertext of what they read included. This test is alone in its binary, so the process's
+//! peak RSS is its own.
 
 use std::path::Path;
 
-use audio_verifier_enclave::{Limits, MAX_FILE_BYTES, MEASURE_JOB_BYTES, app};
+use audio_verifier_enclave::{DECODE_JOB_BYTES, Limits, MAX_FILE_BYTES, app};
 use axum::{
     Router,
     body::{Body, Bytes, to_bytes},
@@ -68,7 +69,7 @@ fn unterminated(total: usize) -> Request<Body> {
     });
     Request::builder()
         .method("POST")
-        .uri("/measure")
+        .uri(format!("/measure?recording_id={}", "c0".repeat(32)))
         .header(header::CONTENT_LENGTH, total)
         .body(Body::from_stream(stream))
         .expect("request")
@@ -103,8 +104,9 @@ async fn unterminated_frames_cost_a_window_each() {
         let message = value["message"].as_str().expect("message");
         assert!(message.contains("is over 16777215 bytes"), "{message}");
     }
+    // Each job holds at most its decoding bound, and the ciphertext of what it has read.
     assert!(
-        grown * 1024 < 2 * MEASURE_JOB_BYTES,
+        grown * 1024 < 2 * 2 * DECODE_JOB_BYTES,
         "peak RSS grew by {grown} KiB"
     );
 }

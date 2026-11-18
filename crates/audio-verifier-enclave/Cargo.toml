@@ -9,19 +9,25 @@ publish.workspace = true
 repository.workspace = true
 
 [dependencies]
+aes-gcm.workspace = true
 audio-verifier.workspace = true
 axum.workspace = true
+bcs.workspace = true
+fastcrypto.workspace = true
 futures-util.workspace = true
 hex.workspace = true
+hkdf.workspace = true
 nautilus = { workspace = true, features = ["vsock"] }
+rand.workspace = true
+seal-crypto.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tokio.workspace = true
+walrus-core.workspace = true
 
 [dev-dependencies]
-bcs.workspace = true
 nautilus = { workspace = true, features = ["test-utils"] }
-sha2.workspace = true
 tower.workspace = true
 
 [lints]

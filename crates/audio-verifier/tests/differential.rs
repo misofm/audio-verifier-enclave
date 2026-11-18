@@ -7,7 +7,7 @@ mod common;
 use std::collections::BTreeMap;
 use std::io::{self, Read};
 
-use audio_verifier::{AudioPayload, Error, measure, measure_reader};
+use audio_verifier::{AudioFacts, Error, measure, measure_reader};
 use common::{Synth, fixture};
 use sha2::{Digest as _, Sha256};
 
@@ -55,7 +55,7 @@ impl Read for Jittered<'_> {
     }
 }
 
-fn check(bytes: &[u8], seed: u64) -> Result<AudioPayload, Error> {
+fn check(bytes: &[u8], seed: u64) -> Result<AudioFacts, Error> {
     let whole = measure(bytes);
     let mut readers: Vec<(String, Box<dyn Read + '_>)> = vec![
         (

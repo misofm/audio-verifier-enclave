@@ -1,6 +1,7 @@
 mod decode;
 mod error;
 mod frame_header;
+mod layout;
 mod self_test;
 mod stream;
 mod streaminfo;
@@ -10,6 +11,9 @@ use std::io::{Cursor, Read};
 use serde::{Deserialize, Serialize};
 
 pub use error::Error;
+pub use layout::{
+    CHANNEL_MASK_FIELD, MAX_SPEAKER, UNASSIGNED, channel_layout, default_layout, masked_layout,
+};
 pub use self_test::self_test;
 
 use streaminfo::StreamInfo;
@@ -22,10 +26,10 @@ pub const SUPPORTED_SAMPLE_RATES: [u32; 8] = [
     44_100, 48_000, 88_200, 96_000, 176_400, 192_000, 352_800, 384_000,
 ];
 
-/// BCS mirror of the Move `audio_verifier::audio_verifier::AudioPayload`, field for field:
-/// the facts of the decoded audio, signed under the audio intent.
+/// The facts of the decoded audio: the first fields of the Move
+/// `audio_verifier::audio_verifier::AudioFacts`, in its order, and the channel layout.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AudioPayload {
+pub struct AudioFacts {
     /// Channel count.
     pub channels: u8,
     /// Bits per sample.
@@ -37,6 +41,9 @@ pub struct AudioPayload {
     /// BLAKE3 of the decoded PCM, interleaved by sample frame, each sample
     /// signed little-endian in `ceil(bit_depth / 8)` bytes.
     pub pcm_digest: Vec<u8>,
+    /// One speaker position per channel, in channel order: the FLAC default for the channel
+    /// count, or the one a `WAVEFORMATEXTENSIBLE_CHANNEL_MASK` Vorbis comment sets.
+    pub channel_layout: Vec<u8>,
 }
 
 /// Most bytes of metadata blocks after STREAMINFO, their 4-byte headers included (64 KiB).
@@ -57,26 +64,33 @@ pub struct FileStats {
     pub peak_held: usize,
 }
 
-/// Measures a FLAC file read front to back from `reader` into its Move-layout `AudioPayload`,
-/// holding only a bounded window of it, and returns the file's length and SHA-256 with it.
+/// Measures a FLAC file read front to back from `reader` into its [`AudioFacts`], holding only a
+/// bounded window of it, and returns the file's length and SHA-256 with them.
 ///
 /// STREAMINFO must be the first metadata block. PADDING, SEEKTABLE and VORBIS_COMMENT blocks may
-/// follow it, up to [`MAX_EXTRA_METADATA_BYTES`] in total, and are ignored: the facts describe
-/// the decoded audio only, so tags never change them.
-pub fn measure_reader<R: Read>(reader: R) -> Result<(AudioPayload, FileStats), Error> {
+/// follow it, up to [`MAX_EXTRA_METADATA_BYTES`] in total. Of them only the
+/// `WAVEFORMATEXTENSIBLE_CHANNEL_MASK` field of a VORBIS_COMMENT changes the facts, through the
+/// channel layout: other tags never do.
+pub fn measure_reader<R: Read>(reader: R) -> Result<(AudioFacts, FileStats), Error> {
     let mut reader = stream::Hashing::new(reader);
-    let (info, head) = stream::read_head(&mut reader)?;
+    let stream::Head {
+        info,
+        bytes: head,
+        channel_mask,
+    } = stream::read_head(&mut reader)?;
     info.validate()?;
+    let channel_layout = channel_layout(info.channels, channel_mask)?;
     let input = Cursor::new(head).chain(&mut reader);
     let (pcm_digest, summary) = decode::verify_and_digest(input, &info)?;
     let (len, sha256) = reader.finish();
     debug_assert_eq!(len, summary.len);
-    let audio = AudioPayload {
+    let audio = AudioFacts {
         channels: info.channels,
         bit_depth: info.bit_depth,
         sample_rate_hz: info.sample_rate_hz,
         samples_per_channel: info.total_samples,
         pcm_digest: pcm_digest.to_vec(),
+        channel_layout,
     };
     let stats = FileStats {
         len,
@@ -87,6 +101,6 @@ pub fn measure_reader<R: Read>(reader: R) -> Result<(AudioPayload, FileStats), E
 }
 
 /// [`measure_reader`] over a file in memory, for its audio facts.
-pub fn measure(bytes: &[u8]) -> Result<AudioPayload, Error> {
+pub fn measure(bytes: &[u8]) -> Result<AudioFacts, Error> {
     measure_reader(bytes).map(|(audio, _)| audio)
 }

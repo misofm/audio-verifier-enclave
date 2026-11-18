@@ -1,13 +1,13 @@
 use std::{error::Error, fs, num::NonZeroUsize, thread, time::Duration};
 
-use audio_verifier_enclave::{Limits, app, measure_jobs, mem_total};
+use audio_verifier_enclave::{Limits, app, measure_jobs, mem_total, self_test};
 use nautilus::{NautilusContext, ServerConfig};
 
 const VSOCK_PORT: u32 = 3000;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    audio_verifier::self_test()?;
+    self_test()?;
     let ctx = NautilusContext::from_runtime()?;
     let cpus = thread::available_parallelism().map_or(1, NonZeroUsize::get);
     let memory = fs::read_to_string("/proc/meminfo")

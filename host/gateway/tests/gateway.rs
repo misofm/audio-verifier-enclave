@@ -7,7 +7,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use audio_verifier_host::{Config, UrlPolicy, app, download_client};
+use audio_verifier_host::{
+    Config, MEASURED_MASTER_TYPE, UrlPolicy, app, download_client, upload_client,
+};
 use axum::{
     Json, Router,
     body::{Body, Bytes},
@@ -116,9 +118,25 @@ fn fake_r2(state: Arc<R2>) -> Router {
         .with_state(state)
 }
 
+const RECORDING_ID: &str = "0xc0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0";
+
+/// The fake enclave's ciphertext of a file: its bytes reversed, then a 16-byte tail.
+fn ciphertext(file: &[u8]) -> Vec<u8> {
+    let mut out: Vec<u8> = file.iter().rev().copied().collect();
+    out.extend_from_slice(&[0xee; 16]);
+    out
+}
+
+/// The blob ID the fake enclave signs, and the fake publisher answers with unless told
+/// otherwise.
+const BLOB_ID: &str = "956rVqcCzB_6B44jO85CZhUo3hlATKF576dhMV4c3do";
+
+/// A request as received: its `Content-Length`, its query and its body.
+type Received = (Option<String>, String, Vec<u8>);
+
 #[derive(Default)]
 struct FakeEnclave {
-    measured: Mutex<Vec<(Option<String>, Vec<u8>)>>,
+    measured: Mutex<Vec<Received>>,
     attested: Mutex<Vec<Vec<u8>>>,
 }
 
@@ -136,13 +154,38 @@ fn fake_enclave(state: Arc<FakeEnclave>, overloaded: bool) -> Router {
                         .headers()
                         .get(header::CONTENT_LENGTH)
                         .map(|value| value.to_str().unwrap().to_owned());
+                    let query = request.uri().query().unwrap_or_default().to_owned();
                     let bytes = axum::body::to_bytes(request.into_body(), usize::MAX).await;
                     let Ok(bytes) = bytes else {
                         return StatusCode::BAD_REQUEST.into_response();
                     };
                     let len = bytes.len();
-                    enclave.measured.lock().unwrap().push((length, bytes.to_vec()));
-                    Json(json!({ "audio": { "len": len }, "public_key": "ab" })).into_response()
+                    let ciphertext = ciphertext(&bytes);
+                    enclave.measured.lock().unwrap().push((length, query, bytes.to_vec()));
+                    let head = json!({
+                        "audio": { "len": len, "blob_id": BLOB_ID },
+                        "ciphertext_size": ciphertext.len().to_string(),
+                        "public_key": "ab",
+                    });
+                    let mut body = serde_json::to_vec(&head).unwrap();
+                    body.push(b'\n');
+                    body.extend_from_slice(&ciphertext);
+                    // Sent in pieces, the JSON split from its newline.
+                    let split = body.len() / 3;
+                    let pieces: Vec<Result<Vec<u8>, std::io::Error>> = vec![
+                        Ok(body[..10].to_vec()),
+                        Ok(body[10..split].to_vec()),
+                        Ok(body[split..].to_vec()),
+                    ];
+                    let length = body.len().to_string();
+                    (
+                        [
+                            (header::CONTENT_TYPE, MEASURED_MASTER_TYPE.to_owned()),
+                            (header::CONTENT_LENGTH, length),
+                        ],
+                        Body::from_stream(stream::iter(pieces)),
+                    )
+                        .into_response()
                 },
             ),
         )
@@ -164,10 +207,54 @@ fn fake_enclave(state: Arc<FakeEnclave>, overloaded: bool) -> Router {
         .with_state(state)
 }
 
+/// A Walrus publisher that stores what it is sent and answers with `answer`'s blob ID, or
+/// fails with `status`.
+#[derive(Default)]
+struct FakePublisher {
+    stored: Mutex<Vec<Received>>,
+    blob_id: Mutex<Option<String>>,
+    status: Mutex<Option<StatusCode>>,
+}
+
+fn fake_publisher(state: Arc<FakePublisher>) -> Router {
+    Router::new()
+        .route(
+            "/v1/blobs",
+            axum::routing::put(
+                |State(publisher): State<Arc<FakePublisher>>, request: Request| async move {
+                    let query = request.uri().query().unwrap_or_default().to_owned();
+                    let length = request
+                        .headers()
+                        .get(header::CONTENT_LENGTH)
+                        .map(|value| value.to_str().unwrap().to_owned());
+                    let bytes = axum::body::to_bytes(request.into_body(), usize::MAX)
+                        .await
+                        .unwrap();
+                    publisher
+                        .stored
+                        .lock()
+                        .unwrap()
+                        .push((length, query, bytes.to_vec()));
+                    if let Some(status) = *publisher.status.lock().unwrap() {
+                        return (status, "no WAL").into_response();
+                    }
+                    let blob_id = publisher.blob_id.lock().unwrap().clone();
+                    let blob_id = blob_id.unwrap_or_else(|| BLOB_ID.into());
+                    Json(json!({
+                        "newlyCreated": { "blobObject": { "blobId": blob_id, "id": "0x1" } }
+                    }))
+                    .into_response()
+                },
+            ),
+        )
+        .with_state(state)
+}
+
 struct Setup {
     gateway: SocketAddr,
     r2: Arc<R2>,
     enclave: Arc<FakeEnclave>,
+    publisher: Arc<FakePublisher>,
 }
 
 async fn setup_with(overloaded: bool, tune: impl FnOnce(&mut Config)) -> Setup {
@@ -175,18 +262,24 @@ async fn setup_with(overloaded: bool, tune: impl FnOnce(&mut Config)) -> Setup {
     let r2_addr = serve(fake_r2(Arc::clone(&r2))).await;
     let enclave = Arc::new(FakeEnclave::default());
     let enclave_addr = serve(fake_enclave(Arc::clone(&enclave), overloaded)).await;
+    let publisher = Arc::new(FakePublisher::default());
+    let publisher_addr = serve(fake_publisher(Arc::clone(&publisher))).await;
     let mut config = Config::new(enclave_addr);
     config.policy = UrlPolicy {
         host_suffixes: vec![".r2.test".into()],
         require_https: false,
     };
+    config.publisher.url = format!("http://{publisher_addr}").parse().unwrap();
+    config.publisher.epochs = 2;
     tune(&mut config);
     let client = download_client(&config, FixedResolver(r2_addr)).unwrap();
-    let gateway = serve(app(config, client)).await;
+    let uploads = upload_client(&config).unwrap();
+    let gateway = serve(app(config, client, uploads)).await;
     Setup {
         gateway,
         r2,
         enclave,
+        publisher,
     }
 }
 
@@ -196,7 +289,8 @@ async fn setup() -> Setup {
 
 impl Setup {
     async fn measure(&self, path: &str) -> (StatusCode, Value) {
-        let body = json!({ "url": format!("http://account.r2.test{path}") }).to_string();
+        let url = format!("http://account.r2.test{path}");
+        let body = json!({ "url": url, "recording_id": RECORDING_ID }).to_string();
         self.post("/measure", body).await
     }
 
@@ -224,13 +318,19 @@ async fn read(response: reqwest::Response) -> (StatusCode, Value) {
 }
 
 #[tokio::test]
-async fn measure_streams_the_file_exactly() {
+async fn measure_streams_the_file_in_and_the_ciphertext_to_walrus() {
     let setup = setup().await;
     let (status, body) = setup.measure("/file").await;
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let size = (FILE_LEN + 16).to_string();
     assert_eq!(
         body,
-        json!({ "audio": { "len": FILE_LEN }, "public_key": "ab" })
+        json!({
+            "audio": { "len": FILE_LEN, "blob_id": BLOB_ID },
+            "ciphertext_size": size,
+            "public_key": "ab",
+            "walrus": { "newlyCreated": { "blobObject": { "blobId": BLOB_ID, "id": "0x1" } } },
+        })
     );
     let measured = setup.enclave.measured.lock().unwrap();
     assert_eq!(measured.len(), 1);
@@ -238,7 +338,41 @@ async fn measure_streams_the_file_exactly() {
         measured[0].0.as_deref(),
         Some(FILE_LEN.to_string().as_str())
     );
-    assert!(measured[0].1 == file());
+    assert_eq!(measured[0].1, format!("recording_id={RECORDING_ID}"));
+    assert!(measured[0].2 == file());
+    let stored = setup.publisher.stored.lock().unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].0.as_deref(), Some(size.as_str()));
+    assert_eq!(stored[0].1, "epochs=2&permanent=true");
+    assert!(stored[0].2 == ciphertext(&file()));
+}
+
+#[tokio::test]
+async fn another_stored_blob_id_or_a_failed_upload_is_bad_gateway() {
+    let setup = setup().await;
+    *setup.publisher.blob_id.lock().unwrap() = Some("other".into());
+    let (status, body) = setup.measure("/file").await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    assert_eq!(body["error"], "blob_id_mismatch");
+    *setup.publisher.status.lock().unwrap() = Some(StatusCode::INTERNAL_SERVER_ERROR);
+    let (status, body) = setup.measure("/file").await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    assert_eq!(body["error"], "upload_failed");
+    assert!(body["message"].as_str().unwrap().contains("no WAL"));
+}
+
+#[tokio::test]
+async fn an_unreachable_publisher_is_bad_gateway() {
+    let unused = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = unused.local_addr().unwrap();
+    drop(unused);
+    let setup = setup_with(false, |config| {
+        config.publisher.url = format!("http://{addr}").parse().unwrap();
+    })
+    .await;
+    let (status, body) = setup.measure("/file").await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    assert_eq!(body["error"], "upload_failed");
 }
 
 #[tokio::test]
@@ -303,13 +437,22 @@ async fn measure_refuses_bad_requests() {
         "http://127.0.0.1/file",
         "ftp://account.r2.test/file",
     ] {
-        let (status, body) = setup
-            .post("/measure", json!({ "url": url }).to_string())
-            .await;
+        let body = json!({ "url": url, "recording_id": RECORDING_ID });
+        let (status, body) = setup.post("/measure", body.to_string()).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{url}");
         assert_eq!(body["error"], "url_not_allowed", "{url}");
     }
-    for invalid in ["", "{}", "not json", r#"{"url":"http://a.r2.test/","x":1}"#] {
+    let short = &RECORDING_ID[..64];
+    let injected = format!("{RECORDING_ID}&recording_id=0x00");
+    for invalid in [
+        "",
+        "{}",
+        "not json",
+        r#"{"url":"http://a.r2.test/file"}"#,
+        &format!(r#"{{"url":"http://a.r2.test/","recording_id":"{RECORDING_ID}","x":1}}"#),
+        &format!(r#"{{"url":"http://a.r2.test/file","recording_id":"{short}"}}"#),
+        &format!(r#"{{"url":"http://a.r2.test/file","recording_id":"{injected}"}}"#),
+    ] {
         let (status, body) = setup.post("/measure", invalid.into()).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{invalid}");
         assert_eq!(body["error"], "invalid_request", "{invalid}");
@@ -333,6 +476,7 @@ async fn measure_is_bounded_in_flight_and_in_time() {
                 gateway,
                 r2: Arc::default(),
                 enclave: Arc::default(),
+                publisher: Arc::default(),
             };
             setup.measure("/hang").await
         }
@@ -393,10 +537,12 @@ async fn an_unreachable_enclave_is_bad_gateway() {
     let mut config = Config::new(addr);
     config.policy.require_https = false;
     let client = download_client(&config, FixedResolver(addr)).unwrap();
+    let uploads = upload_client(&config).unwrap();
     let setup = Setup {
-        gateway: serve(app(config, client)).await,
+        gateway: serve(app(config, client, uploads)).await,
         r2: Arc::default(),
         enclave: Arc::default(),
+        publisher: Arc::default(),
     };
     let (status, body) = setup.get("/health").await;
     assert_eq!(status, StatusCode::BAD_GATEWAY);

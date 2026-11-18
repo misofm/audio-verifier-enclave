@@ -6,10 +6,12 @@ use std::{
     time::Duration,
 };
 
-use audio_verifier::{AudioPayload, measure};
+use audio_verifier::{AudioFacts, measure};
 use audio_verifier_enclave::{
-    ATTEST_BODY_BYTES, AUDIO_INTENT, Limits, MASTER_FILE_INTENT, MAX_FILE_BYTES, MasterFilePayload,
-    MeasureResponse, app,
+    ATTEST_BODY_BYTES, AUDIO_INTENT, AudioPayload, Limits, MASTER_FILE_INTENT, MAX_FILE_BYTES,
+    MEASURED_MASTER_TYPE, MasterFilePayload, MeasureResponse, Pins, app, app_with_pins, identity,
+    master::{MASTER_ASSOCIATED_DATA, SEAL_KEY_SERVER, SEAL_THRESHOLD},
+    tink,
 };
 use axum::{
     Router,
@@ -21,10 +23,15 @@ use nautilus::{
     AttestationError, AttestationRequest, Attestor, EnclaveIdentity, IntentMessage,
     NautilusContext, SignedResponse, intent_message, testing::FakeAttestor, verify_signed_response,
 };
+use rand::{SeedableRng as _, rngs::StdRng};
+use seal_crypto::{
+    EncryptedObject, IBEPublicKeys, IBEUserSecretKeys, create_full_id, ibe, seal_decrypt,
+};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use tower::ServiceExt as _;
+use walrus_core::BlobId;
 
 type Chunk = Result<Bytes, std::io::Error>;
 
@@ -42,6 +49,17 @@ fn router() -> Router {
     app(context(), Limits::new(JOBS))
 }
 
+/// The image's pins with a policy package and a key server key of the tests' own, so a test
+/// can open the sealed DEK.
+fn test_pins() -> (Pins, ibe::MasterKey) {
+    let (master_key, pk) = ibe::generate_key_pair(&mut StdRng::seed_from_u64(5));
+    let pins = Pins {
+        key_server_pk: pk,
+        ..Pins::with_package("0x5ea15ea15ea15ea15ea15ea15ea15ea15ea15ea15ea15ea15ea15ea15ea15ea1")
+    };
+    (pins, master_key)
+}
+
 fn fixture(name: &str) -> Vec<u8> {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../audio-verifier/tests/fixtures")
@@ -57,9 +75,13 @@ fn request(method: &str, uri: &str, body: impl Into<Body>) -> Request<Body> {
         .expect("request")
 }
 
+/// The Recording the tests seal masters to.
+const RECORDING_ID: [u8; 32] = [0xc0; 32];
+
 /// A `/measure` request declaring `length`, if any.
 fn measure_request(body: Body, length: Option<usize>) -> Request<Body> {
-    let mut builder = Request::builder().method("POST").uri("/measure");
+    let uri = format!("/measure?recording_id=0x{}", hex::encode(RECORDING_ID));
+    let mut builder = Request::builder().method("POST").uri(uri);
     if let Some(length) = length {
         builder = builder.header(header::CONTENT_LENGTH, length);
     }
@@ -87,16 +109,43 @@ fn open_body(length: usize) -> (Request<Body>, tokio::sync::mpsc::Sender<Chunk>)
     (measure_request(body, Some(length)), sender)
 }
 
-async fn json(response: Response<Body>) -> (StatusCode, Value) {
+/// The response's status, JSON and the ciphertext after it, if it is a measured master.
+async fn read(response: Response<Body>) -> (StatusCode, Value, Option<Vec<u8>>) {
     let status = response.status();
+    let content_type = response.headers().get(header::CONTENT_TYPE).cloned();
+    let length = response.headers().get(header::CONTENT_LENGTH).cloned();
     let bytes = to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("body");
-    (status, serde_json::from_slice(&bytes).expect("JSON"))
+    if content_type.as_ref().and_then(|value| value.to_str().ok()) != Some(MEASURED_MASTER_TYPE) {
+        return (status, serde_json::from_slice(&bytes).expect("JSON"), None);
+    }
+    assert_eq!(status, StatusCode::OK);
+    let length: usize = length.expect("length").to_str().unwrap().parse().unwrap();
+    assert_eq!(length, bytes.len());
+    let newline = bytes
+        .iter()
+        .position(|&byte| byte == b'\n')
+        .expect("newline");
+    let value: Value = serde_json::from_slice(&bytes[..newline]).expect("JSON");
+    let ciphertext = bytes[newline + 1..].to_vec();
+    assert_eq!(value["ciphertext_size"], ciphertext.len().to_string());
+    (status, value, Some(ciphertext))
+}
+
+async fn json(response: Response<Body>) -> (StatusCode, Value) {
+    let (status, value, _) = read(response).await;
+    (status, value)
 }
 
 async fn send(router: &Router, request: Request<Body>) -> (StatusCode, Value) {
     json(router.clone().oneshot(request).await.expect("response")).await
+}
+
+async fn send_measured(router: &Router, request: Request<Body>) -> (StatusCode, Value, Vec<u8>) {
+    let (status, value, ciphertext) =
+        read(router.clone().oneshot(request).await.expect("response")).await;
+    (status, value, ciphertext.unwrap_or_default())
 }
 
 #[tokio::test]
@@ -248,6 +297,54 @@ async fn unknown_routes_and_methods_get_json_errors() {
     }
 }
 
+/// The payload `body` signed for `facts`: its blob ID and sealed DEK, which must be the blob ID
+/// of `ciphertext` and a Seal encryption to it under `pins`.
+fn payload(
+    body: &MeasureResponse,
+    facts: &AudioFacts,
+    ciphertext: &[u8],
+    pins: &Pins,
+) -> AudioPayload {
+    let blob_id = pins.blob_id(ciphertext).expect("blob ID");
+    assert_eq!(body.audio.data.blob_id, blob_id.to_string());
+    assert_eq!(
+        body.audio.data.blob_id_u256,
+        audio_verifier_enclave::u256_le_decimal(&blob_id.0)
+    );
+    let sealed_dek = hex::decode(&body.audio.data.sealed_dek).expect("hex");
+    let object: EncryptedObject = bcs::from_bytes(&sealed_dek).expect("EncryptedObject");
+    assert_eq!(object.package_id, pins.package);
+    assert_eq!(object.id, identity(&RECORDING_ID, &blob_id));
+    assert_eq!(object.services, vec![(pins.key_server, 1)]);
+    assert_eq!(object.threshold, SEAL_THRESHOLD);
+    assert_eq!(pins.key_server.to_string(), SEAL_KEY_SERVER);
+    AudioPayload::new(facts.clone(), blob_id.0, sealed_dek)
+}
+
+/// Opens the sealed DEK with the key server's master key and decrypts `ciphertext`.
+fn open(
+    payload: &AudioPayload,
+    ciphertext: &[u8],
+    pins: &Pins,
+    master_key: &ibe::MasterKey,
+) -> Vec<u8> {
+    let object: EncryptedObject = bcs::from_bytes(&payload.sealed_dek).expect("EncryptedObject");
+    let blob_id = BlobId(payload.blob_id);
+    let full_id = create_full_id(
+        &pins.package.into_inner(),
+        &identity(&RECORDING_ID, &blob_id),
+    );
+    let keys = IBEUserSecretKeys::BonehFranklinBLS12381(
+        [(pins.key_server, ibe::extract(master_key, &full_id))].into(),
+    );
+    let public = IBEPublicKeys::BonehFranklinBLS12381(vec![pins.key_server_pk]);
+    let dek: [u8; 32] = seal_decrypt(&object, &keys, Some(&public))
+        .expect("the DEK opens")
+        .try_into()
+        .expect("32 bytes");
+    tink::decrypt(&dek, MASTER_ASSOCIATED_DATA, ciphertext).expect("the ciphertext opens")
+}
+
 /// Rebuilds both signed messages from `audio` and `file` and checks `body`'s signatures over
 /// them, and that neither verifies under the other's intent.
 fn verify(ctx: &NautilusContext, body: &MeasureResponse, audio: &AudioPayload, file: &[u8]) {
@@ -286,13 +383,15 @@ fn verify(ctx: &NautilusContext, body: &MeasureResponse, audio: &AudioPayload, f
 }
 
 #[tokio::test]
-async fn file_is_signed_twice_with_one_timestamp_however_chunked() {
+async fn file_is_encrypted_sealed_and_signed_twice_however_chunked() {
     let ctx = context();
-    let router = app(ctx.clone(), Limits::new(JOBS));
+    let (pins, master_key) = test_pins();
+    let router = app_with_pins(ctx.clone(), Limits::new(JOBS), pins.clone());
     let bytes = fixture("s16_stereo_44100.flac");
     let measured = measure(&bytes).expect("fixture");
+    let mut blob_ids = Vec::new();
     for chunk in [1, 7, 4096, 1 << 20, bytes.len()] {
-        let (status, value) = send(&router, streamed(&bytes, chunk)).await;
+        let (status, value, ciphertext) = send_measured(&router, streamed(&bytes, chunk)).await;
         assert_eq!(status, StatusCode::OK, "chunks of {chunk}: {value}");
         let body: MeasureResponse = serde_json::from_value(value.clone()).expect("shape");
         let expected = json!({
@@ -304,6 +403,10 @@ async fn file_is_signed_twice_with_one_timestamp_however_chunked() {
                 "sample_rate_hz": 44_100,
                 "samples_per_channel": "11025",
                 "pcm_digest": hex::encode(&measured.pcm_digest),
+                "channel_layout": [0, 1],
+                "blob_id": body.audio.data.blob_id,
+                "blob_id_u256": body.audio.data.blob_id_u256,
+                "sealed_dek": body.audio.data.sealed_dek,
                 "signature": body.audio.signature,
             },
             "master_file": {
@@ -313,12 +416,36 @@ async fn file_is_signed_twice_with_one_timestamp_however_chunked() {
                 "file_sha256": hex::encode(Sha256::digest(&bytes)),
                 "signature": body.master_file.signature,
             },
+            "ciphertext_size": tink::ciphertext_size(bytes.len() as u64).to_string(),
             "public_key": ctx.public_key_hex(),
         });
         assert_eq!(value, expected, "chunks of {chunk}");
         assert!(body.audio.timestamp_ms > 1_700_000_000_000);
-        verify(&ctx, &body, &measured, &bytes);
+        let payload = payload(&body, &measured, &ciphertext, &pins);
+        verify(&ctx, &body, &payload, &bytes);
+        assert_eq!(open(&payload, &ciphertext, &pins, &master_key), bytes);
+        blob_ids.push(body.audio.data.blob_id);
     }
+    // Every request has its own DEK, salt and nonce prefix, so its own ciphertext.
+    blob_ids.sort();
+    blob_ids.dedup();
+    assert_eq!(blob_ids.len(), 5);
+}
+
+#[tokio::test]
+async fn the_image_pins_seal_to_the_committee_key_server() {
+    let router = router();
+    let bytes = fixture("s16_mono_44100.flac");
+    let (status, value, ciphertext) = send_measured(&router, streamed(&bytes, 4096)).await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    let body: MeasureResponse = serde_json::from_value(value).expect("shape");
+    assert_eq!(body.audio.data.channel_layout, [2]);
+    payload(
+        &body,
+        &measure(&bytes).expect("fixture"),
+        &ciphertext,
+        &Pins::pinned(),
+    );
 }
 
 /// `canonical` with a codec-style VORBIS_COMMENT and 8 KiB of PADDING after STREAMINFO.
@@ -341,11 +468,12 @@ fn tagged(canonical: &[u8]) -> Vec<u8> {
 #[tokio::test]
 async fn tags_do_not_change_the_audio_but_are_in_the_file_binding() {
     let ctx = context();
-    let router = app(ctx.clone(), Limits::new(JOBS));
+    let (pins, master_key) = test_pins();
+    let router = app_with_pins(ctx.clone(), Limits::new(JOBS), pins.clone());
     let canonical = fixture("s16_stereo_44100.flac");
     let tagged = tagged(&canonical);
     let measured = measure(&canonical).expect("fixture");
-    let (status, value) = send(&router, streamed(&tagged, 4096)).await;
+    let (status, value, ciphertext) = send_measured(&router, streamed(&tagged, 4096)).await;
     assert_eq!(status, StatusCode::OK, "{value}");
     let body: MeasureResponse = serde_json::from_value(value).expect("shape");
     assert_eq!(
@@ -356,7 +484,10 @@ async fn tags_do_not_change_the_audio_but_are_in_the_file_binding() {
         body.master_file.data.file_sha256,
         hex::encode(Sha256::digest(&tagged))
     );
-    verify(&ctx, &body, &measured, &tagged);
+    let payload = payload(&body, &measured, &ciphertext, &pins);
+    verify(&ctx, &body, &payload, &tagged);
+    // The whole file is encrypted, its tags included.
+    assert_eq!(open(&payload, &ciphertext, &pins, &master_key), tagged);
 }
 
 #[tokio::test]
@@ -365,7 +496,7 @@ async fn rejected_files_get_the_library_verdict_unsigned_however_chunked() {
     let canonical = fixture("s16_stereo_44100.flac");
     let mut corrupt = canonical.clone();
     corrupt[30] ^= 1;
-    let audio = measure(&canonical).expect("fixture");
+    let audio = AudioPayload::new(measure(&canonical).expect("fixture"), [3; 32], vec![4; 8]);
     let message = intent_message(AUDIO_INTENT, 1_750_000_000_000, &audio).expect("BCS");
     let mut picture = canonical[..42].to_vec();
     picture[4] &= 0x7f;
@@ -407,6 +538,45 @@ async fn rejected_files_get_the_library_verdict_unsigned_however_chunked() {
             assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{name}: {value}");
             assert_eq!(value, expected, "{name}");
         }
+    }
+}
+
+#[tokio::test]
+async fn the_recording_id_is_required_once_as_32_hex_bytes() {
+    let router = router();
+    let bytes = fixture("s16_stereo_44100.flac");
+    let id = hex::encode(RECORDING_ID);
+    for query in [
+        String::new(),
+        "?recording=0x00".into(),
+        "?recording_id=".into(),
+        format!("?recording_id=0x{}", &id[2..]),
+        format!("?recording_id=0x{id}00"),
+        format!("?recording_id=0x{}zz", &id[2..]),
+        format!("?recording_id=0x{id}&recording_id=0x{id}"),
+    ] {
+        let request = Request::builder()
+            .method("POST")
+            .uri(format!("/measure{query}"))
+            .header(header::CONTENT_LENGTH, bytes.len())
+            .body(Body::from(bytes.clone()))
+            .expect("request");
+        let (status, value) = send(&router, request).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {value}");
+        assert_eq!(value["error"], "invalid_request", "{query}");
+    }
+    for query in [
+        format!("?recording_id={id}"),
+        format!("?x=1&recording_id=0x{}", id.to_uppercase()),
+    ] {
+        let request = Request::builder()
+            .method("POST")
+            .uri(format!("/measure{query}"))
+            .header(header::CONTENT_LENGTH, bytes.len())
+            .body(Body::from(bytes.clone()))
+            .expect("request");
+        let (status, value) = send(&router, request).await;
+        assert_eq!(status, StatusCode::OK, "{query}: {value}");
     }
 }
 

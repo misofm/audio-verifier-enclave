@@ -25,6 +25,21 @@ pub enum Error {
     /// A SEEKTABLE block is not a whole number of 18-byte seek points.
     #[error("SEEKTABLE length is {0}, not a multiple of 18")]
     SeekTableLength(u32),
+    /// A VORBIS_COMMENT block's lengths do not add up to the block.
+    #[error("VORBIS_COMMENT block is malformed")]
+    VorbisComment,
+    /// More than one WAVEFORMATEXTENSIBLE_CHANNEL_MASK field.
+    #[error("WAVEFORMATEXTENSIBLE_CHANNEL_MASK appears more than once")]
+    ChannelMaskRepeated,
+    /// A WAVEFORMATEXTENSIBLE_CHANNEL_MASK value that is not `0x` and hexadecimal digits.
+    #[error("WAVEFORMATEXTENSIBLE_CHANNEL_MASK value {0:?} is not 0x and at most 8 hex digits")]
+    ChannelMaskValue(String),
+    /// A channel mask with bits above 17, the last speaker position.
+    #[error("channel mask {0:#x} has bits above 17, the last speaker position")]
+    ChannelMaskBits(u32),
+    /// A channel mask that assigns more speakers than there are channels.
+    #[error("channel mask {mask:#x} assigns more speakers than the {channels} channels")]
+    ChannelMaskChannels { mask: u32, channels: u8 },
     /// STREAMINFO block length is not 34.
     #[error("STREAMINFO length is {0}, expected 34")]
     StreamInfoLength(u32),

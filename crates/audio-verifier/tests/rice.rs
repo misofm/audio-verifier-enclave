@@ -9,7 +9,7 @@ mod common;
 
 use std::io::{self, Read};
 
-use audio_verifier::{AudioPayload, Error, measure, measure_reader};
+use audio_verifier::{AudioFacts, Error, measure, measure_reader};
 use common::{BitWriter, crc8, crc16, fixture, utf8_number};
 use md5::{Digest as _, Md5};
 
@@ -31,7 +31,7 @@ impl Read for Chunked<'_> {
 
 /// Measures `bytes` read whole, then in several chunk sizes and split in two at every
 /// `step`-th offset, and requires the same result, error included, from each.
-fn same_everywhere(bytes: &[u8], step: usize) -> Result<AudioPayload, Error> {
+fn same_everywhere(bytes: &[u8], step: usize) -> Result<AudioFacts, Error> {
     let whole = measure(bytes);
     for chunk in [1, 7, 100, 4096, 9000] {
         let reader = Chunked {

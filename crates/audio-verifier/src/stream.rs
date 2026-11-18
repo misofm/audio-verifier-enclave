@@ -2,6 +2,7 @@ use std::io::{self, Read};
 
 use sha2::{Digest as _, Sha256};
 
+use crate::layout::find_channel_mask;
 use crate::streaminfo::HEADER_LENGTH;
 use crate::{Error, MAX_EXTRA_METADATA_BYTES, StreamInfo};
 
@@ -60,16 +61,27 @@ fn fill(reader: &mut impl Read, buffer: &mut [u8]) -> Result<usize, Error> {
     Ok(filled)
 }
 
-/// Reads the `fLaC` marker and the metadata, returning STREAMINFO and every byte read.
+/// The metadata of a file: STREAMINFO, every byte read, and the channel mask, if a
+/// VORBIS_COMMENT block sets one.
+pub(crate) struct Head {
+    pub info: StreamInfo,
+    pub bytes: Vec<u8>,
+    pub channel_mask: Option<u32>,
+}
+
+/// Reads the `fLaC` marker and the metadata.
 ///
 /// STREAMINFO must come first. Blocks of [`SKIPPED_BLOCK_TYPES`] may follow it, up to
 /// [`MAX_EXTRA_METADATA_BYTES`] in total with their headers; any other block is rejected.
-pub(crate) fn read_head(reader: &mut impl Read) -> Result<(StreamInfo, Vec<u8>), Error> {
+/// VORBIS_COMMENT blocks must be well formed, and at most one field among them may be the
+/// channel mask.
+pub(crate) fn read_head(reader: &mut impl Read) -> Result<Head, Error> {
     let mut head = vec![0; HEADER_LENGTH];
     let filled = fill(reader, &mut head)?;
     head.truncate(filled);
     let (info, mut last) = StreamInfo::parse(&head)?;
     let mut extra = 0u32;
+    let mut channel_mask = None;
     while !last {
         let mut header = [0; 4];
         let filled = fill(reader, &mut header)?;
@@ -97,6 +109,18 @@ pub(crate) fn read_head(reader: &mut impl Read) -> Result<(StreamInfo, Vec<u8>),
         if filled < length as usize {
             return Err(Error::TooShort(start + filled));
         }
+        if block_type == VORBIS_COMMENT
+            && let Some(mask) = find_channel_mask(&head[start..])?
+        {
+            if channel_mask.is_some() {
+                return Err(Error::ChannelMaskRepeated);
+            }
+            channel_mask = Some(mask);
+        }
     }
-    Ok((info, head))
+    Ok(Head {
+        info,
+        bytes: head,
+        channel_mask,
+    })
 }
