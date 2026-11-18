@@ -105,6 +105,11 @@ fn recording_id(request: &Request) -> Result<[u8; 32], String> {
     let (Some(value), None) = (values.next(), values.next()) else {
         return Err("the recording_id query parameter is required once".into());
     };
+    object_id(value)
+}
+
+/// A Recording's 32-byte object ID from hex, with or without `0x`.
+pub(crate) fn object_id(value: &str) -> Result<[u8; 32], String> {
     let digits = value.strip_prefix("0x").unwrap_or(value);
     let invalid = || format!("recording_id {value:?} is not a 32-byte hex object ID");
     if digits.len() != 64 {
@@ -136,15 +141,13 @@ pub(crate) async fn measure(State(service): State<Arc<Service>>, request: Reques
         return refuse(ErrorCode::Overloaded, "server is at its concurrency limit");
     };
     let deadline = service.limits.request_timeout;
+    let chunk_timeout = service.limits.chunk_timeout;
+    let body = request.into_body();
     match timeout(
         deadline,
-        run(
-            &service,
-            permit,
-            request.into_body(),
-            declared,
-            recording_id,
-        ),
+        run(&service, permit, declared, recording_id, |sender| {
+            deliver(body, declared, chunk_timeout, sender)
+        }),
     )
     .await
     {
@@ -156,13 +159,20 @@ pub(crate) async fn measure(State(service): State<Arc<Service>>, request: Reques
     }
 }
 
-async fn run(
+/// Measures, encrypts and seals the `declared` bytes of plaintext that `deliver` sends, and
+/// answers the measured master. `deliver` refuses a body that does not arrive whole, and stops
+/// as soon as the decoder does; the decoder's verdict is then the answer.
+pub(crate) async fn run<D, F>(
     service: &Service,
     permit: OwnedSemaphorePermit,
-    body: Body,
     declared: u64,
     recording_id: [u8; 32],
-) -> Response {
+    deliver: D,
+) -> Response
+where
+    D: FnOnce(mpsc::Sender<io::Result<Bytes>>) -> F,
+    F: Future<Output = Result<(), Response>>,
+{
     let (sender, receiver) = mpsc::channel(QUEUED_CHUNKS);
     let pins = Arc::clone(&service.pins);
     // The permit is held until the job stops, also when this future is dropped at the
@@ -172,7 +182,7 @@ async fn run(
         let sealed = measure_and_seal(receiver, declared, &recording_id, &pins);
         (sealed, permit)
     });
-    let delivered = deliver(body, declared, service.limits.chunk_timeout, sender).await;
+    let delivered = deliver(sender).await;
     let measured = job.await;
     if let Err(refused) = delivered {
         return refused;

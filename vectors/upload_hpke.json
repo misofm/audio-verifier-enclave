@@ -1,0 +1,28 @@
+{
+  "suite": "DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, AES-256-GCM; base mode",
+  "x25519_ikm": "1111111111111111111111111111111111111111111111111111111111111111",
+  "x25519_public_key": "1a239249ea74403babc01f32df9931a16f71ac8972c461d69fed15640e310639",
+  "ephemeral_ikm": "2222222222222222222222222222222222222222222222222222222222222222",
+  "policy": "eb9fdb274f4edbda86b322cbb876a4f92aa6b9e58964d6d5953ff0cead49160e",
+  "recording_id": "c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0",
+  "file_size": "11",
+  "key_expires_ms": "1750000600000",
+  "info_hex": "6d69736f2d6d61737465722d75706c6f61642d7631eb9fdb274f4edbda86b322cbb876a4f92aa6b9e58964d6d5953ff0cead49160ec0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0000000000000000b00000197742a03c0",
+  "enc": "e3b9708aaa21a7f1e62a95ee28d1e5d60b0fceed6c68599013a54b318e9e0b15",
+  "frames": [
+    {
+      "offset": 0,
+      "last": false,
+      "plaintext_hex": "6d69736f20",
+      "aad_hex": "000000000000000000",
+      "frame_hex": "0000000000000000f9a3ef99134a602d59c1f024e24cce2aea698d1e65"
+    },
+    {
+      "offset": 5,
+      "last": true,
+      "plaintext_hex": "6d6173746572",
+      "aad_hex": "000000000000000501",
+      "frame_hex": "0000000000000005d9b3ec9f152a40bcb60e0b4181eb8760aa29839ac603"
+    }
+  ]
+}
