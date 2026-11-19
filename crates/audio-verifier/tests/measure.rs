@@ -1083,3 +1083,42 @@ fn ffmpeg_layouts_are_read_from_its_files() {
         assert_eq!(audio.channel_layout, expected, "{layout}");
     }
 }
+
+#[test]
+fn the_sink_receives_exactly_the_digested_pcm() {
+    struct Collect(Option<audio_verifier::AudioFacts>, Vec<u8>);
+    impl audio_verifier::PcmSink for Collect {
+        fn start(&mut self, format: &audio_verifier::AudioFacts) {
+            self.0 = Some(format.clone());
+        }
+        fn write(&mut self, pcm: &[u8]) {
+            self.1.extend_from_slice(pcm);
+        }
+    }
+    let bytes = std::fs::read(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/s24_stereo_48000.flac"),
+    )
+    .expect("fixture");
+    let mut sink = Collect(None, Vec::new());
+    let (facts, _) = audio_verifier::measure_reader_with(&bytes[..], &mut sink).expect("measures");
+    let start = sink.0.expect("start is called");
+    assert_eq!(start.pcm_digest, Vec::<u8>::new());
+    assert_eq!(
+        (
+            start.channels,
+            start.bit_depth,
+            start.sample_rate_hz,
+            start.samples_per_channel
+        ),
+        (
+            facts.channels,
+            facts.bit_depth,
+            facts.sample_rate_hz,
+            facts.samples_per_channel
+        )
+    );
+    assert_eq!(start.channel_layout, facts.channel_layout);
+    assert_eq!(sink.1.len() as u64, facts.samples_per_channel * 2 * 3);
+    assert_eq!(blake3::hash(&sink.1).as_bytes().to_vec(), facts.pcm_digest);
+}

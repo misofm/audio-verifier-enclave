@@ -46,6 +46,26 @@ pub struct AudioFacts {
     pub channel_layout: Vec<u8>,
 }
 
+/// Receives the decoded audio of [`measure_reader_with`] as it is decoded, before the file has
+/// been checked to its end: a caller must discard what it made from it unless the measurement
+/// succeeds.
+pub trait PcmSink {
+    /// Called once, after the metadata and before any PCM, with the facts STREAMINFO declares
+    /// and the channel layout; `pcm_digest` is empty.
+    fn start(&mut self, format: &AudioFacts);
+    /// One frame's PCM, interleaved by sample frame, each sample signed little-endian in
+    /// `ceil(bit_depth / 8)` bytes: the bytes [`AudioFacts::pcm_digest`] hashes, in order.
+    fn write(&mut self, pcm: &[u8]);
+}
+
+/// A sink that keeps nothing.
+struct Discard;
+
+impl PcmSink for Discard {
+    fn start(&mut self, _: &AudioFacts) {}
+    fn write(&mut self, _: &[u8]) {}
+}
+
 /// Most bytes of metadata blocks after STREAMINFO, their 4-byte headers included (64 KiB).
 pub const MAX_EXTRA_METADATA_BYTES: u32 = 64 * 1024;
 
@@ -72,6 +92,14 @@ pub struct FileStats {
 /// `WAVEFORMATEXTENSIBLE_CHANNEL_MASK` field of a VORBIS_COMMENT changes the facts, through the
 /// channel layout: other tags never do.
 pub fn measure_reader<R: Read>(reader: R) -> Result<(AudioFacts, FileStats), Error> {
+    measure_reader_with(reader, &mut Discard)
+}
+
+/// [`measure_reader`], handing the decoded PCM to `sink` as it goes.
+pub fn measure_reader_with<R: Read>(
+    reader: R,
+    sink: &mut (dyn PcmSink + Send),
+) -> Result<(AudioFacts, FileStats), Error> {
     let mut reader = stream::Hashing::new(reader);
     let stream::Head {
         info,
@@ -80,8 +108,16 @@ pub fn measure_reader<R: Read>(reader: R) -> Result<(AudioFacts, FileStats), Err
     } = stream::read_head(&mut reader)?;
     info.validate()?;
     let channel_layout = channel_layout(info.channels, channel_mask)?;
+    sink.start(&AudioFacts {
+        channels: info.channels,
+        bit_depth: info.bit_depth,
+        sample_rate_hz: info.sample_rate_hz,
+        samples_per_channel: info.total_samples,
+        pcm_digest: Vec::new(),
+        channel_layout: channel_layout.clone(),
+    });
     let input = Cursor::new(head).chain(&mut reader);
-    let (pcm_digest, summary) = decode::verify_and_digest(input, &info)?;
+    let (pcm_digest, summary) = decode::verify_and_digest(input, &info, sink)?;
     let (len, blake3) = reader.finish();
     debug_assert_eq!(len, summary.len);
     let audio = AudioFacts {
