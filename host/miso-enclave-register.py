@@ -3,9 +3,11 @@
 
 Fetches the enclave's public key and a fresh Nitro attestation through its host gateway, then
 submits `0x2::nitro_attestation::load_nitro_attestation` and `enclave::register<App>` in one
-transaction signed by the operations key, through Sui GraphQL. A key already registered at the
-policy's current version is success; one registered at an older version is removed
-(`remove_stale`) and registered again in the same transaction.
+transaction signed by the operations key, through Sui GraphQL. The transaction is simulated
+first and sent only if it would succeed. A key already registered at the policy's current
+version is success; one registered at an older version is removed (`remove_stale`) and
+registered again in the same transaction. While the policy's PCRs are not the running image's,
+it checks again every minute, without spending gas, until the policy's admin sets them.
 
 Needs Python 3.9+ and `cryptography`. The operations key file holds the 32-byte Ed25519 seed as
 hex, readable only by root; the script prints the operations address, never the key.
@@ -31,6 +33,11 @@ GRAPHQL = "https://graphql.testnet.sui.io/graphql"
 CLOCK = "0x" + "0" * 63 + "6"
 GAS_BUDGET = 100_000_000
 ALREADY_REGISTERED = 9
+INVALID_PCRS = 5
+
+
+class Untrusted(Exception):
+    """The policy's PCRs are not the running image's: wait for its admin to set them."""
 
 
 class Fatal(Exception):
@@ -215,6 +222,22 @@ def register(args):
     kind += uleb(len(commands)) + b"".join(commands)
     gas, expiration = gas_and_expiration(ops_address, price)
     tx = bytes([0]) + kind + addr(ops_address) + gas + expiration
+    simulated = graphql(
+        """query($tx: JSON!) {
+          simulateTransaction(transaction: $tx) {
+            effects { status executionError { abortCode message } }
+          }
+        }""",
+        {"tx": {"bcs": {"value": base64.b64encode(tx).decode()}}},
+    )["simulateTransaction"]["effects"]
+    if simulated["status"] != "SUCCESS":
+        code = str((simulated.get("executionError") or {}).get("abortCode"))
+        if code == str(ALREADY_REGISTERED):
+            print(f"[register] {health['pk']} is already registered")
+            return
+        if code == str(INVALID_PCRS):
+            raise Untrusted(f"the policy's PCRs are not this image's; waiting for set_pcrs")
+        raise Fatal(f"the registration would fail: {simulated}")
     digest = hashlib.blake2b(bytes([0, 0, 0]) + tx, digest_size=32).digest()
     signature = bytes([0]) + key.sign(digest) + ops_pk
     result = graphql(
@@ -281,6 +304,9 @@ def main():
                 sys.exit(1)
             print(f"[register] retrying: {error}", file=sys.stderr)
             time.sleep(10)
+        except Untrusted as error:
+            print(f"[register] {error}", file=sys.stderr)
+            time.sleep(60)
         except Fatal as error:
             print(f"[register] {error}", file=sys.stderr)
             sys.exit(1)

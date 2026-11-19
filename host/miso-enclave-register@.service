@@ -10,6 +10,7 @@ StartLimitBurst=3
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+TimeoutStartSec=infinity
 ExecStart=/usr/local/bin/miso-enclave-register --env /etc/miso/%i.register.env
 Restart=on-failure
 RestartSec=120

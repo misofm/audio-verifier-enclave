@@ -6,15 +6,17 @@ use libflac::{Frame, Handler};
 use md5::{Digest as _, Md5};
 
 use crate::frame_header::{self, FrameHeader};
-use crate::{Error, StreamInfo};
+use crate::{Error, PcmSink, StreamInfo};
 
 const PIPELINE_DEPTH: usize = 4;
 
 /// Decodes the stream, checks every frame against `info`, and returns the BLAKE3 digest of its
-/// PCM with how the decode ended.
+/// PCM with how the decode ended. Each frame's packed PCM also goes to `sink`, in order, from
+/// the hashing thread.
 pub(crate) fn verify_and_digest(
     input: impl Read,
     info: &StreamInfo,
+    sink: &mut (dyn PcmSink + Send),
 ) -> Result<([u8; 32], libflac::Summary), Error> {
     let (full, filled) = mpsc::sync_channel::<Vec<u8>>(PIPELINE_DEPTH);
     let (empty, recycled) = mpsc::sync_channel::<Vec<u8>>(PIPELINE_DEPTH);
@@ -29,6 +31,7 @@ pub(crate) fn verify_and_digest(
             for pcm in filled {
                 md5.update(&pcm);
                 blake3.update(&pcm);
+                sink.write(&pcm);
                 if empty.send(pcm).is_err() {
                     break;
                 }
