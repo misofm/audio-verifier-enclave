@@ -15,10 +15,10 @@ use walrus_core::{
 use crate::tink::KEY_BYTES;
 
 /// The `recording_master_access` package on testnet whose `seal_approve` (the Recording's owner)
-/// and `seal_approve_enclave` (an enclave policy the owner approved) guard every DEK: its original
-/// package ID, the namespace of every Seal identity.
+/// and `seal_approve_enclave` (an enclave holding the owner's grant for that master) guard every
+/// DEK: its original package ID, the namespace of every Seal identity.
 pub const RECORDING_MASTER_ACCESS_PACKAGE: &str =
-    "0xfb09173cd7bb894eb5175d78e15365ece3c2c391aa6df2c3c92b107d810d7784";
+    "0xc370c70e65b1aa16f429b90dc1ee7080fb4090ddb1b3c914adc32b8b430f0270";
 
 /// Walrus testnet's shard count, from the system object
 /// `0x6c2547cbbc38025cf3adac45f63cb0a8d12ecf777cdc75a4971612bf97fdf6af` (epoch 585,
