@@ -29,6 +29,7 @@ tokio.workspace = true
 walrus-core.workspace = true
 
 [dev-dependencies]
+blake3.workspace = true
 nautilus = { workspace = true, features = ["test-utils"] }
 # The RNG traits hpke 0.13 takes, for the tests' HPKE sender.
 rand_core_09 = { package = "rand_core", version = "0.9.5" }

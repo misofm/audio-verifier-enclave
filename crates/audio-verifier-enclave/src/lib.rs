@@ -237,15 +237,15 @@ impl<T> SignedJson<T> {
 }
 
 /// BCS layout of the file binding signed under [`MASTER_FILE_INTENT`]: the payload signed under
-/// [`AUDIO_INTENT`], and the size and SHA-256 of the exact plaintext bytes measured.
+/// [`AUDIO_INTENT`], and the size and BLAKE3 of the exact plaintext bytes measured.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MasterFilePayload {
     /// The audio payload.
     pub audio: AudioPayload,
     /// Bytes of the file.
     pub file_size: u64,
-    /// SHA-256 of the file's bytes.
-    pub file_sha256: Vec<u8>,
+    /// BLAKE3 of the file's bytes.
+    pub file_blake3: Vec<u8>,
 }
 
 /// JSON view of a `MasterFilePayload`'s own fields; its `audio` is the response's `audio`.
@@ -253,8 +253,8 @@ pub struct MasterFilePayload {
 pub struct FileJson {
     /// Bytes of the file as a decimal string.
     pub file_size: String,
-    /// SHA-256 of the file as hex.
-    pub file_sha256: String,
+    /// BLAKE3 of the file as hex.
+    pub file_blake3: String,
 }
 
 /// The JSON that starts a `/measure` response: the payload and the file binding, signed with
@@ -284,13 +284,13 @@ pub fn sign_measurement(
     let binding = MasterFilePayload {
         audio: audio.clone(),
         file_size: file.len,
-        file_sha256: file.sha256.to_vec(),
+        file_blake3: file.blake3.to_vec(),
     };
     let audio = ctx.sign_intent_stamped(AUDIO_INTENT, timestamp, audio)?;
     let binding = ctx.sign_intent_stamped(MASTER_FILE_INTENT, timestamp, binding)?;
     let file = FileJson {
         file_size: file.len.to_string(),
-        file_sha256: hex::encode(file.sha256),
+        file_blake3: hex::encode(file.blake3),
     };
     Ok(MeasureResponse {
         audio: SignedJson::new(audio, audio_json),

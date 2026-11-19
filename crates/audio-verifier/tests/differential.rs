@@ -9,7 +9,6 @@ use std::io::{self, Read};
 
 use audio_verifier::{AudioFacts, Error, measure, measure_reader};
 use common::{Synth, fixture};
-use sha2::{Digest as _, Sha256};
 
 const DEFAULT_ITERATIONS: usize = 150;
 
@@ -84,7 +83,7 @@ fn check(bytes: &[u8], seed: u64) -> Result<AudioFacts, Error> {
     for (name, reader) in readers {
         let chunked = measure_reader(reader).map(|(audio, stats)| {
             assert_eq!(stats.len, bytes.len() as u64, "{name}, seed {seed}");
-            assert_eq!(stats.sha256, <[u8; 32]>::from(Sha256::digest(bytes)));
+            assert_eq!(stats.blake3, *blake3::hash(bytes).as_bytes());
             audio
         });
         assert_eq!(chunked, whole, "{name}, seed {seed}, {} bytes", bytes.len());

@@ -31,7 +31,6 @@ use rand::{RngCore as _, SeedableRng as _, rngs::StdRng};
 use seal_crypto::{EncryptedObject, IBEPublicKeys, IBEUserSecretKeys, create_full_id, ibe};
 use serde::Serialize;
 use serde_json::{Value, json};
-use sha2::{Digest as _, Sha256};
 use tower::ServiceExt as _;
 use walrus_core::BlobId;
 
@@ -235,8 +234,8 @@ async fn an_upload_measures_and_seals_as_its_file() {
     assert_eq!(status, StatusCode::OK, "{measured}");
     assert_eq!(measured["master_file"]["file_size"], file.len().to_string());
     assert_eq!(
-        measured["master_file"]["file_sha256"],
-        hex::encode(Sha256::digest(&file))
+        measured["master_file"]["file_blake3"],
+        hex::encode(blake3::hash(&file).as_bytes())
     );
     assert_eq!(measured["audio"]["channels"], 2);
     assert_eq!(measured["audio"]["bit_depth"], 24);

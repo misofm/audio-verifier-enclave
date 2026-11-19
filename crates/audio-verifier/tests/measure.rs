@@ -8,7 +8,6 @@ use common::{
     frame_sizes, has_ffmpeg, scratch_file, set_block_sizes, set_frame_sizes, set_md5,
     set_streaminfo, utf8_number,
 };
-use sha2::{Digest as _, Sha256};
 
 /// Hands out at most `chunk` bytes per read, as a network body does.
 struct Chunked<'a> {
@@ -49,7 +48,7 @@ fn measure_streamed(bytes: &[u8], chunk: usize) -> Result<(AudioFacts, FileStats
 fn measure(bytes: &[u8]) -> Result<AudioFacts, Error> {
     let result = measure_reader(bytes).map(|(audio, stats)| {
         assert_eq!(stats.len, bytes.len() as u64);
-        assert_eq!(stats.sha256, <[u8; 32]>::from(Sha256::digest(bytes)));
+        assert_eq!(stats.blake3, *blake3::hash(bytes).as_bytes());
         audio
     });
     for chunk in CHUNKS {

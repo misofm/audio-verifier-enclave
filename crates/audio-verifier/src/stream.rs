@@ -1,7 +1,5 @@
 use std::io::{self, Read};
 
-use sha2::{Digest as _, Sha256};
-
 use crate::layout::find_channel_mask;
 use crate::streaminfo::HEADER_LENGTH;
 use crate::{Error, MAX_EXTRA_METADATA_BYTES, StreamInfo};
@@ -20,7 +18,7 @@ const SEEK_POINT_LENGTH: u32 = 18;
 pub(crate) struct Hashing<R> {
     reader: R,
     len: u64,
-    sha256: Sha256,
+    blake3: blake3::Hasher,
 }
 
 impl<R> Hashing<R> {
@@ -28,20 +26,20 @@ impl<R> Hashing<R> {
         Self {
             reader,
             len: 0,
-            sha256: Sha256::new(),
+            blake3: blake3::Hasher::new(),
         }
     }
 
-    /// The bytes read and their SHA-256.
+    /// The bytes read and their BLAKE3.
     pub(crate) fn finish(self) -> (u64, [u8; 32]) {
-        (self.len, self.sha256.finalize().into())
+        (self.len, self.blake3.finalize().into())
     }
 }
 
 impl<R: Read> Read for Hashing<R> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         let count = self.reader.read(buffer)?;
-        self.sha256.update(&buffer[..count]);
+        self.blake3.update(&buffer[..count]);
         self.len += count as u64;
         Ok(count)
     }

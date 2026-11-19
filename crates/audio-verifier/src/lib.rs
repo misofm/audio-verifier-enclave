@@ -58,14 +58,14 @@ pub const MAX_DECODED_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 pub struct FileStats {
     /// Bytes of the file.
     pub len: u64,
-    /// SHA-256 of the file's bytes.
-    pub sha256: [u8; 32],
+    /// BLAKE3 of the file's bytes.
+    pub blake3: [u8; 32],
     /// The most input bytes the decoder held at once.
     pub peak_held: usize,
 }
 
 /// Measures a FLAC file read front to back from `reader` into its [`AudioFacts`], holding only a
-/// bounded window of it, and returns the file's length and SHA-256 with them.
+/// bounded window of it, and returns the file's length and BLAKE3 with them.
 ///
 /// STREAMINFO must be the first metadata block. PADDING, SEEKTABLE and VORBIS_COMMENT blocks may
 /// follow it, up to [`MAX_EXTRA_METADATA_BYTES`] in total. Of them only the
@@ -82,7 +82,7 @@ pub fn measure_reader<R: Read>(reader: R) -> Result<(AudioFacts, FileStats), Err
     let channel_layout = channel_layout(info.channels, channel_mask)?;
     let input = Cursor::new(head).chain(&mut reader);
     let (pcm_digest, summary) = decode::verify_and_digest(input, &info)?;
-    let (len, sha256) = reader.finish();
+    let (len, blake3) = reader.finish();
     debug_assert_eq!(len, summary.len);
     let audio = AudioFacts {
         channels: info.channels,
@@ -94,7 +94,7 @@ pub fn measure_reader<R: Read>(reader: R) -> Result<(AudioFacts, FileStats), Err
     };
     let stats = FileStats {
         len,
-        sha256,
+        blake3,
         peak_held: summary.peak_held,
     };
     Ok((audio, stats))

@@ -28,7 +28,6 @@ use seal_crypto::{
     EncryptedObject, IBEPublicKeys, IBEUserSecretKeys, create_full_id, ibe, seal_decrypt,
 };
 use serde_json::{Value, json};
-use sha2::{Digest as _, Sha256};
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use tower::ServiceExt as _;
 use walrus_core::BlobId;
@@ -365,7 +364,7 @@ fn verify(ctx: &NautilusContext, body: &MeasureResponse, audio: &AudioPayload, f
             data: MasterFilePayload {
                 audio: audio.clone(),
                 file_size: file.len() as u64,
-                file_sha256: Sha256::digest(file).to_vec(),
+                file_blake3: blake3::hash(file).as_bytes().to_vec(),
             },
         },
         signature: body.master_file.signature.clone(),
@@ -413,7 +412,7 @@ async fn file_is_encrypted_sealed_and_signed_twice_however_chunked() {
                 "intent": 2,
                 "timestamp_ms": body.audio.timestamp_ms,
                 "file_size": bytes.len().to_string(),
-                "file_sha256": hex::encode(Sha256::digest(&bytes)),
+                "file_blake3": hex::encode(blake3::hash(&bytes).as_bytes()),
                 "signature": body.master_file.signature,
             },
             "ciphertext_size": tink::ciphertext_size(bytes.len() as u64).to_string(),
@@ -481,8 +480,8 @@ async fn tags_do_not_change_the_audio_but_are_in_the_file_binding() {
         hex::encode(&measured.pcm_digest)
     );
     assert_eq!(
-        body.master_file.data.file_sha256,
-        hex::encode(Sha256::digest(&tagged))
+        body.master_file.data.file_blake3,
+        hex::encode(blake3::hash(&tagged).as_bytes())
     );
     let payload = payload(&body, &measured, &ciphertext, &pins);
     verify(&ctx, &body, &payload, &tagged);

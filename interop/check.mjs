@@ -20,7 +20,7 @@ const read = (name) => readFileSync(join(outDir, name));
 const requireApp = createRequire(join(appDir, 'package.json'));
 const load = (name) => import(pathToFileURL(requireApp.resolve(name)).href);
 
-const SEAL_PACKAGE = '0xf2452914718b6f8d3cadef6e04d390fb66b496e7e5095de67b254eecbd77b6fb';
+const SEAL_PACKAGE = '0xfb09173cd7bb894eb5175d78e15365ece3c2c391aa6df2c3c92b107d810d7784';
 const KEY_SERVER = '0xb012378c9f3799fb5b1a7083da74a4069e3c3f1c93de0b27212a5799ce1e1e98';
 const AGGREGATOR = 'https://seal-aggregator-testnet.mystenlabs.com';
 const PINNED_PK =
