@@ -9,7 +9,6 @@
 // is not run here; its signature check is.
 
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import http from 'node:http';
 import { join } from 'node:path';
@@ -19,11 +18,12 @@ const [sdkDir, flacPath, enclave = 'http://127.0.0.1:3000'] = process.argv.slice
 if (!flacPath) throw new Error('usage: upload.mjs <sdk> <flac> [enclave URL]');
 const sdk = await import(pathToFileURL(join(sdkDir, 'dist/index.js')).href);
 const { Effect } = await import(pathToFileURL(join(sdkDir, 'node_modules/effect/dist/index.js')).href);
+const { blake3 } = await import(pathToFileURL(join(sdkDir, 'node_modules/@noble/hashes/blake3.js')).href);
 
 const POLICY = '0xeb9fdb274f4edbda86b322cbb876a4f92aa6b9e58964d6d5953ff0cead49160e';
 const RECORDING = '0x' + 'c0'.repeat(32);
 const file = new Uint8Array(readFileSync(flacPath));
-const sha256 = createHash('sha256').update(file).digest('hex');
+const fileBlake3 = Buffer.from(blake3(file)).toString('hex');
 
 const keyJson = await (await fetch(`${enclave}/upload-key`)).json();
 const key = await Effect.runPromise(sdk.decodeUploadKey(keyJson));
@@ -71,11 +71,11 @@ const good = await seal();
 assert.ok(good.frames.length >= 2, 'the file needs at least two frames');
 const done = await post(good.start, good.frames);
 assert.equal(done.status, 200, JSON.stringify(done.error));
-assert.equal(done.measured.master_file.file_sha256, sha256);
+assert.equal(done.measured.master_file.file_blake3, fileBlake3);
 assert.equal(done.measured.master_file.file_size, String(file.length));
 assert.equal(done.measured.public_key, keyJson.public_key);
 const measurement = await Effect.runPromise(sdk.decodeMeasurement(done.measured));
-console.log(`measured ${file.length} bytes in ${good.frames.length} frames in ${done.seconds.toFixed(2)} s: ${measurement.pcm.channels} ch, ${measurement.pcm.bitDepth}-bit, ${measurement.pcm.sampleRateHz} Hz, sha256 ${sha256.slice(0, 16)}…, blob ${done.measured.audio.blob_id}`);
+console.log(`measured ${file.length} bytes in ${good.frames.length} frames in ${done.seconds.toFixed(2)} s: ${measurement.pcm.channels} ch, ${measurement.pcm.bitDepth}-bit, ${measurement.pcm.sampleRateHz} Hz, blake3 ${fileBlake3.slice(0, 16)}…, blob ${done.measured.audio.blob_id}`);
 
 // 2. Tampering is refused.
 const swap = (frames, a, b) => frames.map((f, i) => (i === a ? frames[b] : i === b ? frames[a] : f));

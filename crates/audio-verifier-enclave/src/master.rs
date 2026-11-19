@@ -1,5 +1,5 @@
 //! The encrypted master: the file under a fresh DEK ([`crate::tink`]), the Walrus blob ID of
-//! that ciphertext, and the DEK Seal-encrypted under `recording_master_seal` to the identity of
+//! that ciphertext, and the DEK Seal-encrypted under `recording_master_access` to the identity of
 //! the recording and the blob. Every network parameter is pinned here, so it is part of the
 //! image and its PCRs.
 
@@ -14,10 +14,11 @@ use walrus_core::{
 
 use crate::tink::KEY_BYTES;
 
-/// The `recording_master_seal` package on testnet whose `seal_approve` guards every DEK: its
-/// original package ID, the namespace of every Seal identity.
-pub const RECORDING_MASTER_SEAL_PACKAGE: &str =
-    "0xf2452914718b6f8d3cadef6e04d390fb66b496e7e5095de67b254eecbd77b6fb";
+/// The `recording_master_access` package on testnet whose `seal_approve` (the Recording's owner)
+/// and `seal_approve_enclave` (an enclave policy the owner approved) guard every DEK: its original
+/// package ID, the namespace of every Seal identity.
+pub const RECORDING_MASTER_ACCESS_PACKAGE: &str =
+    "0xfb09173cd7bb894eb5175d78e15365ece3c2c391aa6df2c3c92b107d810d7784";
 
 /// Walrus testnet's shard count, from the system object
 /// `0x6c2547cbbc38025cf3adac45f63cb0a8d12ecf777cdc75a4971612bf97fdf6af` (epoch 585,
@@ -65,7 +66,7 @@ fn object_id(hex_id: &str) -> ObjectID {
 impl Pins {
     /// The image's pins.
     pub fn pinned() -> Self {
-        Self::with_package(RECORDING_MASTER_SEAL_PACKAGE)
+        Self::with_package(RECORDING_MASTER_ACCESS_PACKAGE)
     }
 
     /// The image's pins, with another policy package, for tests.
@@ -117,7 +118,7 @@ impl Pins {
     }
 }
 
-/// The Seal identity of a master after the package ID, as `recording_master_seal` checks it:
+/// The Seal identity of a master after the package ID, as `recording_master_access` checks it:
 /// `bcs(recording_id: address) ‖ bcs(blob_id: u256)`, the recording's 32 object ID bytes, then
 /// the blob ID's 32 bytes, which are Walrus's own and the little-endian `u256`.
 pub fn identity(recording_id: &[u8; 32], blob_id: &BlobId) -> [u8; 64] {
@@ -241,7 +242,7 @@ mod tests {
     #[test]
     fn the_pins_parse() {
         let pins = Pins::pinned();
-        assert_eq!(pins.package, object_id(RECORDING_MASTER_SEAL_PACKAGE));
+        assert_eq!(pins.package, object_id(RECORDING_MASTER_ACCESS_PACKAGE));
         assert_eq!(pins.walrus.n_shards(), WALRUS_N_SHARDS);
         assert_eq!(WALRUS_ENCODING, DEFAULT_ENCODING);
     }

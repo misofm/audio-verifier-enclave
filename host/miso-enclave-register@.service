@@ -1,0 +1,18 @@
+[Unit]
+Description=Register the %i enclave's key on its Sui enclave policy
+Documentation=https://github.com/misofm/audio-verifier-enclave/tree/main/host
+Wants=network-online.target
+After=network-online.target %i-enclave.service %i-host.service
+PartOf=%i-enclave.service
+StartLimitIntervalSec=3600
+StartLimitBurst=3
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/miso-enclave-register --env /etc/miso/%i.register.env
+Restart=on-failure
+RestartSec=120
+
+[Install]
+WantedBy=multi-user.target %i-enclave.service

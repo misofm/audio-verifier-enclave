@@ -30,7 +30,7 @@ struct Vector<T> {
 }
 
 /// A `MasterFilePayload` as JSON: the audio facts as in `audio_intent.json`, and the file's
-/// size and SHA-256 as in the `/measure` response's `master_file`.
+/// size and BLAKE3 as in the `/measure` response's `master_file`.
 #[derive(Serialize)]
 struct MasterFileFields {
     audio: AudioJson,
@@ -92,13 +92,13 @@ fn the_route_signs_the_committed_vectors() {
     let audio = AudioPayload::new(facts, blob_id, vec![0x5e; 40]);
     let file = FileStats {
         len: 285_050_717,
-        sha256: [0x22; 32],
+        blake3: [0x22; 32],
         peak_held: 0,
     };
     let master_file = MasterFilePayload {
         audio: audio.clone(),
         file_size: file.len,
-        file_sha256: file.sha256.to_vec(),
+        file_blake3: file.blake3.to_vec(),
     };
     let timestamp = Timestamp::from_ms(TIMESTAMP_MS);
     let signed =

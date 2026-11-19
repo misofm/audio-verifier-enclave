@@ -271,7 +271,6 @@ dependencies = [
  "libflac",
  "md-5",
  "serde",
- "sha2 0.10.9",
  "thiserror 2.0.18",
 ]
 
@@ -283,6 +282,7 @@ dependencies = [
  "audio-verifier",
  "axum",
  "bcs 0.1.6",
+ "blake3",
  "bytes",
  "crypto",
  "fastcrypto 0.1.11",

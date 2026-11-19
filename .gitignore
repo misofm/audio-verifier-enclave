@@ -3,3 +3,4 @@
 /vendor
 /host/gateway/target
 /interop/out
+__pycache__/
