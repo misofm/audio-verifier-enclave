@@ -4,6 +4,8 @@
 # NETWORK (testnet, the default, or mainnet) must be the network the image was built for
 # (`make eif NETWORK=...`). WALRUS_PUBLISHER is the publisher /measure stores ciphertexts with:
 # testnet's public one by default, required on mainnet, which has no public publisher.
+# OPS_KMS_KEY, optional, is the ARN of an AWS KMS secp256k1 key that signs registrations in place
+# of a generated /etc/miso/ops.key.
 set -euo pipefail
 
 eif=${1:?usage: [NETWORK=mainnet WALRUS_PUBLISHER=<url>] host/setup.sh <nitro.eif> [vCPUs] [MiB]}
@@ -83,6 +85,19 @@ install -m 0755 "$here/gateway/target/release/audio-verifier-host" /usr/local/bi
 install -m 0755 "$here/miso-enclave-register.py" /usr/local/bin/miso-enclave-register
 install -m 0644 "$here/audio-verifier-enclave.service" "$here/argonaut.service" \
 	"$here/audio-verifier-host.service" "$here/miso-enclave-register@.service" /etc/systemd/system/
+# The operations key that signs registrations: an AWS KMS secp256k1 key by ARN (OPS_KMS_KEY,
+# signed with the instance's role; the key never leaves KMS), else an Ed25519 seed in a file.
+if [ -n "${OPS_KMS_KEY:-}" ]; then
+	case "$OPS_KMS_KEY" in
+	arn:aws:kms:*:*:key/*) ops_line="OPS_KMS_KEY=$OPS_KMS_KEY" ;;
+	*)
+		echo "OPS_KMS_KEY must be a KMS key ARN (arn:aws:kms:<region>:<account>:key/<id>)" >&2
+		exit 1
+		;;
+	esac
+else
+	ops_line=OPS_KEY=/etc/miso/ops.key
+fi
 if [ ! -f "$register_env" ]; then
 	cat > "$register_env" <<-ENV
 	NETWORK=$network
@@ -91,12 +106,12 @@ if [ ! -f "$register_env" ]; then
 	APP=$app
 	ENCLAVE_PACKAGE=$enclave_package
 	GRAPHQL=$graphql
-	OPS_KEY=/etc/miso/ops.key
+	$ops_line
 	ENV
 elif ! grep -q '^GRAPHQL=' "$register_env"; then
 	echo "GRAPHQL=$graphql" >> "$register_env"
 fi
-if [ ! -f /etc/miso/ops.key ]; then
+if [ -z "${OPS_KMS_KEY:-}" ] && [ ! -f /etc/miso/ops.key ]; then
 	(umask 077 && python3 -c 'import os; print(os.urandom(32).hex())' > /etc/miso/ops.key)
 fi
 systemctl daemon-reload
@@ -105,5 +120,5 @@ systemctl enable audio-verifier-enclave.service argonaut.service audio-verifier-
 	miso-enclave-register@audio-verifier.service
 echo "Installed. Start with: systemctl start audio-verifier-enclave argonaut audio-verifier-host"
 echo "Every start makes a new enclave key; miso-enclave-register@audio-verifier registers it with the"
-echo "operations key /etc/miso/ops.key, whose address needs $network SUI:"
+echo "operations key (OPS_KMS_KEY or /etc/miso/ops.key), whose address needs $network SUI:"
 echo "  miso-enclave-register --address"

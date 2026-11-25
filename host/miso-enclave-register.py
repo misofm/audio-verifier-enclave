@@ -12,8 +12,10 @@ it checks again every minute, without spending gas, until the policy's admin set
 The network is the env file's `GRAPHQL` endpoint (`https://graphql.testnet.sui.io/graphql` or
 `https://graphql.mainnet.sui.io/graphql`), which `host/setup.sh` writes with the policy.
 
-Needs Python 3.9+ and `cryptography`. The operations key file holds the 32-byte Ed25519 seed as
-hex, readable only by root; the script prints the operations address, never the key.
+Needs Python 3.9+ and `cryptography`. The operations key is either an AWS KMS secp256k1 signing
+key (`OPS_KMS_KEY`, its ARN: the private key never leaves KMS, and each signature is one
+`aws kms sign` with the instance's role) or a file holding a 32-byte Ed25519 seed as hex,
+readable only by root (`OPS_KEY`). The script prints the operations address, never a key.
 
     miso-enclave-register.py --env /etc/miso/<enclave>.register.env
     miso-enclave-register.py --ops-key /etc/miso/ops.key --address   # print the ops address
@@ -24,13 +26,20 @@ import base64
 import hashlib
 import json
 import os
+import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
+from cryptography.hazmat.primitives.serialization import (
+    Encoding,
+    PublicFormat,
+    load_der_public_key,
+)
 
 GRAPHQL = None
 CLOCK = "0x" + "0" * 63 + "6"
@@ -120,13 +129,63 @@ def http_json(url, payload=None):
         return json.load(response)
 
 
-def load_key(path):
-    with open(path) as f:
-        seed = bytes.fromhex(f.read().strip())
-    key = Ed25519PrivateKey.from_private_bytes(seed)
-    pk = key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
-    address = "0x" + hashlib.blake2b(bytes([0]) + pk, digest_size=32).hexdigest()
-    return key, pk, address
+SECP256K1_N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+
+
+def sui_address(flag, pk):
+    return "0x" + hashlib.blake2b(bytes([flag]) + pk, digest_size=32).hexdigest()
+
+
+class FileSigner:
+    """An Ed25519 key from a file of its 32-byte seed in hex (Sui flag 0)."""
+
+    def __init__(self, path):
+        with open(path) as f:
+            self.key = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(f.read().strip()))
+        self.pk = self.key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+        self.address = sui_address(0, self.pk)
+
+    def sign(self, digest):
+        return bytes([0]) + self.key.sign(digest) + self.pk
+
+
+class KmsSigner:
+    """An AWS KMS ECC_SECG_P256K1 key, by ARN (Sui flag 1). Sui's secp256k1 signs SHA-256 of
+    the 32-byte transaction digest, which is KMS's ECDSA_SHA_256 over the digest as a RAW
+    message; KMS's DER signature becomes r || s with s normalised to the lower half."""
+
+    def __init__(self, arn):
+        self.arn = arn
+        self.region = arn.split(":")[3]
+        der = base64.b64decode(self._kms("get-public-key")["PublicKey"])
+        public = load_der_public_key(der)
+        self.pk = public.public_bytes(Encoding.X962, PublicFormat.CompressedPoint)
+        self.address = sui_address(1, self.pk)
+
+    def _kms(self, *args):
+        out = subprocess.run(
+            ["aws", "kms", *args, "--region", self.region, "--key-id", self.arn,
+             "--output", "json"],
+            check=True, capture_output=True, text=True, timeout=30,
+        ).stdout
+        return json.loads(out)
+
+    def sign(self, digest):
+        with tempfile.NamedTemporaryFile() as message:
+            message.write(digest)
+            message.flush()
+            der = base64.b64decode(self._kms(
+                "sign", "--message", f"fileb://{message.name}", "--message-type", "RAW",
+                "--signing-algorithm", "ECDSA_SHA_256",
+            )["Signature"])
+        r, s = decode_dss_signature(der)
+        if s > SECP256K1_N // 2:
+            s = SECP256K1_N - s
+        return bytes([1]) + r.to_bytes(32, "big") + s.to_bytes(32, "big") + self.pk
+
+
+def load_signer(args):
+    return KmsSigner(args.ops_kms_key) if args.ops_kms_key else FileSigner(args.ops_key)
 
 
 def policy_state(policy, enclave_package, pk):
@@ -189,7 +248,8 @@ def b58decode(s):
 
 
 def register(args):
-    key, ops_pk, ops_address = load_key(args.ops_key)
+    signer = load_signer(args)
+    ops_address = signer.address
     health = http_json(f"{args.gateway}/health")
     pk = bytes.fromhex(health["pk"])
     isv, version, registered = policy_state(args.policy, args.enclave_package, pk)
@@ -242,7 +302,7 @@ def register(args):
             raise Untrusted(f"the policy's PCRs are not this image's; waiting for set_pcrs")
         raise Fatal(f"the registration would fail: {simulated}")
     digest = hashlib.blake2b(bytes([0, 0, 0]) + tx, digest_size=32).digest()
-    signature = bytes([0]) + key.sign(digest) + ops_pk
+    signature = signer.sign(digest)
     result = graphql(
         """mutation($tx: Base64!, $sig: [Base64!]!) {
           executeTransaction(transactionDataBcs: $tx, signatures: $sig) {
@@ -279,6 +339,9 @@ def main():
         "--env", help="file of GATEWAY, POLICY, APP, ENCLAVE_PACKAGE, GRAPHQL, OPS_KEY"
     )
     parser.add_argument("--ops-key", default="/etc/miso/ops.key")
+    parser.add_argument(
+        "--ops-kms-key", help="ARN of an AWS KMS secp256k1 signing key, instead of --ops-key"
+    )
     parser.add_argument("--gateway")
     parser.add_argument("--policy")
     parser.add_argument("--app", help="the policy's App type, 0xADDR::module::NAME")
@@ -295,8 +358,9 @@ def main():
         args.enclave_package = args.enclave_package or env.get("ENCLAVE_PACKAGE")
         args.graphql = args.graphql or env.get("GRAPHQL")
         args.ops_key = env.get("OPS_KEY", args.ops_key)
+        args.ops_kms_key = args.ops_kms_key or env.get("OPS_KMS_KEY")
     if args.address:
-        print(load_key(args.ops_key)[2])
+        print(load_signer(args).address)
         return
     if not all([args.gateway, args.policy, args.app, args.enclave_package, args.graphql]):
         parser.error("GATEWAY, POLICY, APP, ENCLAVE_PACKAGE and GRAPHQL are required")
@@ -307,7 +371,8 @@ def main():
         try:
             register(args)
             return
-        except (urllib.error.URLError, ConnectionError, TimeoutError, RuntimeError) as error:
+        except (urllib.error.URLError, ConnectionError, TimeoutError, RuntimeError,
+                subprocess.SubprocessError) as error:
             if time.monotonic() > deadline:
                 print(f"[register] giving up: {error}", file=sys.stderr)
                 sys.exit(1)
