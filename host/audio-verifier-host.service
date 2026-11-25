@@ -4,7 +4,8 @@ After=network-online.target argonaut.service
 Wants=network-online.target
 
 [Service]
-ExecStart=/usr/local/bin/audio-verifier-host
+EnvironmentFile=/etc/miso/audio-verifier.host.env
+ExecStart=/usr/local/bin/audio-verifier-host --walrus-publisher ${WALRUS_PUBLISHER}
 Restart=always
 RestartSec=2
 DynamicUser=yes

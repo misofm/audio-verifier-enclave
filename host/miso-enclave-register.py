@@ -9,6 +9,9 @@ version is success; one registered at an older version is removed (`remove_stale
 registered again in the same transaction. While the policy's PCRs are not the running image's,
 it checks again every minute, without spending gas, until the policy's admin sets them.
 
+The network is the env file's `GRAPHQL` endpoint (`https://graphql.testnet.sui.io/graphql` or
+`https://graphql.mainnet.sui.io/graphql`), which `host/setup.sh` writes with the policy.
+
 Needs Python 3.9+ and `cryptography`. The operations key file holds the 32-byte Ed25519 seed as
 hex, readable only by root; the script prints the operations address, never the key.
 
@@ -29,7 +32,7 @@ import urllib.request
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
-GRAPHQL = "https://graphql.testnet.sui.io/graphql"
+GRAPHQL = None
 CLOCK = "0x" + "0" * 63 + "6"
 GAS_BUDGET = 100_000_000
 ALREADY_REGISTERED = 9
@@ -272,12 +275,15 @@ def read_env(path):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--env", help="file of GATEWAY, POLICY, APP, ENCLAVE_PACKAGE, OPS_KEY")
+    parser.add_argument(
+        "--env", help="file of GATEWAY, POLICY, APP, ENCLAVE_PACKAGE, GRAPHQL, OPS_KEY"
+    )
     parser.add_argument("--ops-key", default="/etc/miso/ops.key")
     parser.add_argument("--gateway")
     parser.add_argument("--policy")
     parser.add_argument("--app", help="the policy's App type, 0xADDR::module::NAME")
     parser.add_argument("--enclave-package")
+    parser.add_argument("--graphql", help="the network's Sui GraphQL endpoint")
     parser.add_argument("--address", action="store_true", help="print the ops address and exit")
     parser.add_argument("--wait-secs", type=int, default=600)
     args = parser.parse_args()
@@ -287,12 +293,15 @@ def main():
         args.policy = args.policy or env.get("POLICY")
         args.app = args.app or env.get("APP")
         args.enclave_package = args.enclave_package or env.get("ENCLAVE_PACKAGE")
+        args.graphql = args.graphql or env.get("GRAPHQL")
         args.ops_key = env.get("OPS_KEY", args.ops_key)
     if args.address:
         print(load_key(args.ops_key)[2])
         return
-    if not all([args.gateway, args.policy, args.app, args.enclave_package]):
-        parser.error("GATEWAY, POLICY, APP and ENCLAVE_PACKAGE are required")
+    if not all([args.gateway, args.policy, args.app, args.enclave_package, args.graphql]):
+        parser.error("GATEWAY, POLICY, APP, ENCLAVE_PACKAGE and GRAPHQL are required")
+    global GRAPHQL
+    GRAPHQL = args.graphql
     deadline = time.monotonic() + args.wait_secs
     while True:
         try:
