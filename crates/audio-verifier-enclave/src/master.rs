@@ -1,9 +1,7 @@
 //! The encrypted master: the file under a fresh DEK ([`crate::tink`]), the Walrus blob ID of
 //! that ciphertext, and the DEK Seal-encrypted under `recording_master_access` to the identity of
 //! the recording and the blob. Every network parameter is pinned here, so it is part of the
-//! image and its PCRs.
-
-use std::num::NonZeroU16;
+//! image and its PCRs: [`testnet`]'s by default, [`mainnet`]'s with the `mainnet` feature.
 
 use fastcrypto::{groups::bls12381::G2Element, serde_helpers::ToFromByteArray as _};
 use seal_crypto::{EncryptionInput, IBEPublicKeys, ObjectID, seal_encrypt};
@@ -12,33 +10,79 @@ use walrus_core::{
     encoding::{EncodingConfig, EncodingFactory as _},
 };
 
+#[cfg(feature = "mainnet")]
+pub use self::mainnet::*;
+#[cfg(not(feature = "mainnet"))]
+pub use self::testnet::*;
 use crate::tink::KEY_BYTES;
 
-/// The `recording_master_access` package on testnet whose `seal_approve` (the Recording's owner)
-/// and `seal_approve_enclave` (an enclave holding the owner's grant for that master) guard every
-/// DEK: its original package ID, the namespace of every Seal identity.
-pub const RECORDING_MASTER_ACCESS_PACKAGE: &str =
-    "0xc370c70e65b1aa16f429b90dc1ee7080fb4090ddb1b3c914adc32b8b430f0270";
+/// Testnet's pins, the image's by default.
+pub mod testnet {
+    use std::num::NonZeroU16;
 
-/// Walrus testnet's shard count, from the system object
-/// `0x6c2547cbbc38025cf3adac45f63cb0a8d12ecf777cdc75a4971612bf97fdf6af` (epoch 585,
-/// November 2026).
-pub const WALRUS_N_SHARDS: NonZeroU16 = NonZeroU16::new(1000).unwrap();
+    /// The `recording_master_access` package on testnet whose `seal_approve` (the Recording's
+    /// owner) and `seal_approve_enclave` (an enclave holding the owner's grant for that master)
+    /// guard every DEK: its original package ID, the namespace of every Seal identity.
+    pub const RECORDING_MASTER_ACCESS_PACKAGE: &str =
+        "0xc370c70e65b1aa16f429b90dc1ee7080fb4090ddb1b3c914adc32b8b430f0270";
+
+    /// The `EnclavePolicy<AUDIO_VERIFIER>` on testnet, named in every upload's HPKE `info`: the
+    /// policy a client checked the upload key against.
+    pub const AUDIO_VERIFIER_POLICY: &str =
+        "0xeb9fdb274f4edbda86b322cbb876a4f92aa6b9e58964d6d5953ff0cead49160e";
+
+    /// Walrus testnet's shard count, from the system object
+    /// `0x6c2547cbbc38025cf3adac45f63cb0a8d12ecf777cdc75a4971612bf97fdf6af` (epoch 585,
+    /// November 2026).
+    pub const WALRUS_N_SHARDS: NonZeroU16 = NonZeroU16::new(1000).unwrap();
+
+    /// Seal's decentralized testnet key server: one `KeyServer` object whose key a 3-of-5
+    /// committee holds in shares, so a threshold of 1 asks it once.
+    pub const SEAL_KEY_SERVER: &str =
+        "0xb012378c9f3799fb5b1a7083da74a4069e3c3f1c93de0b27212a5799ce1e1e98";
+
+    /// That key server's BLS12-381 G2 public key, `KeyServerV2.pk` (version 2).
+    pub const SEAL_KEY_SERVER_PK: &str = "b8068e916e76791ec188624be83cabe2563719ed991a9732e54e8a\
+        04271037bc5f3b35356b2f9e22b3f5aa84856800f219bc7472422ffcaced0c921f43b4f192662deb294c063\
+        9dbf0e2d00ade5483bcae7c70b25f9c8a1d3d21130ce441febe";
+}
+
+/// Mainnet's pins, the image's with the `mainnet` feature.
+pub mod mainnet {
+    use std::num::NonZeroU16;
+
+    /// The `recording_master_access` package on mainnet whose `seal_approve` (the Recording's
+    /// owner) and `seal_approve_enclave` (an enclave holding the owner's grant for that master)
+    /// guard every DEK: its original package ID, the namespace of every Seal identity.
+    pub const RECORDING_MASTER_ACCESS_PACKAGE: &str =
+        "0xe0262111397c8bfbef7ec8b785e249ce6b4eaf03c63cc4caf11b99fb38ebc0ec";
+
+    /// The `EnclavePolicy<AUDIO_VERIFIER>` of `audio_verifier`
+    /// `0x11f24c8cd2aa5dd42580c6799922a6197b2ef6a93cff2f64b6bb8f86ffdc47e4` on mainnet, named in
+    /// every upload's HPKE `info`: the policy a client checked the upload key against.
+    pub const AUDIO_VERIFIER_POLICY: &str =
+        "0x7d5d2a995a4b243c408c3cf09f8f037211161494c3636f668696c844031fda1e";
+
+    /// Walrus mainnet's shard count, from the system object
+    /// `0x2134d52768ea07e8c43570ef975eb3e4c27a39fa6396bef985b5abc58d03ddd2` (epoch 44,
+    /// November 2026).
+    pub const WALRUS_N_SHARDS: NonZeroU16 = NonZeroU16::new(1000).unwrap();
+
+    /// Seal's decentralized mainnet key server: one `KeyServer` object whose key a 5-of-8
+    /// committee holds in shares, so a threshold of 1 asks it once.
+    pub const SEAL_KEY_SERVER: &str =
+        "0x686098f1439237fff9f36b99c7329683c22979d2005c2465cb891acb012a7595";
+
+    /// That key server's BLS12-381 G2 public key, `KeyServerV2.pk` (version 2).
+    pub const SEAL_KEY_SERVER_PK: &str = "aa2bc42ff27451d38d83f491d05ca200b20a0bf5704e48c4b02fdd\
+        4d33397556b4e3e8a2467cd129b469ae314879dee817a804590d4aeca548124da68cc8f4d90cc3fdacc3b30\
+        936a393938eb4bb2315e91b0dc8ab704ceae22c314c6ef91198";
+}
 
 /// Walrus's encoding type, RedStuff over Reed-Solomon, walrus-core's `DEFAULT_ENCODING`.
 pub const WALRUS_ENCODING: EncodingType = EncodingType::RS2;
 
-/// Seal's decentralized testnet key server: one `KeyServer` object whose key a 3-of-5
-/// committee holds in shares, so a threshold of 1 asks it once.
-pub const SEAL_KEY_SERVER: &str =
-    "0xb012378c9f3799fb5b1a7083da74a4069e3c3f1c93de0b27212a5799ce1e1e98";
-
-/// That key server's BLS12-381 G2 public key, `KeyServerV2.pk` (version 2).
-pub const SEAL_KEY_SERVER_PK: &str = "b8068e916e76791ec188624be83cabe2563719ed991a9732e54e8a04\
-    271037bc5f3b35356b2f9e22b3f5aa84856800f219bc7472422ffcaced0c921f43b4f192662deb294c0639dbf0\
-    e2d00ade5483bcae7c70b25f9c8a1d3d21130ce441febe";
-
-/// Key servers that must answer for the DEK.
+/// Key servers that must answer for the DEK: on either network, one committee behind one key.
 pub const SEAL_THRESHOLD: u8 = 1;
 
 /// The associated data of every master's ciphertext: none. The DEK encrypts one file only, and
@@ -243,8 +287,70 @@ mod tests {
     fn the_pins_parse() {
         let pins = Pins::pinned();
         assert_eq!(pins.package, object_id(RECORDING_MASTER_ACCESS_PACKAGE));
+        assert_eq!(pins.key_server, object_id(SEAL_KEY_SERVER));
         assert_eq!(pins.walrus.n_shards(), WALRUS_N_SHARDS);
         assert_eq!(WALRUS_ENCODING, DEFAULT_ENCODING);
+    }
+
+    /// Both networks' pins, whichever the build selects: 32-byte IDs, a key on G2, and the
+    /// 1,000 shards that [`KNOWN_BLOB_IDS`] were computed at.
+    #[test]
+    fn both_networks_pins_parse() {
+        let networks = [
+            (
+                testnet::RECORDING_MASTER_ACCESS_PACKAGE,
+                testnet::AUDIO_VERIFIER_POLICY,
+                testnet::SEAL_KEY_SERVER,
+                testnet::SEAL_KEY_SERVER_PK,
+                testnet::WALRUS_N_SHARDS,
+            ),
+            (
+                mainnet::RECORDING_MASTER_ACCESS_PACKAGE,
+                mainnet::AUDIO_VERIFIER_POLICY,
+                mainnet::SEAL_KEY_SERVER,
+                mainnet::SEAL_KEY_SERVER_PK,
+                mainnet::WALRUS_N_SHARDS,
+            ),
+        ];
+        let mut ids = Vec::new();
+        for (package, policy, key_server, key_server_pk, n_shards) in networks {
+            for id in [package, policy, key_server] {
+                assert_eq!(id.len(), 66, "{id}");
+                assert!(id.starts_with("0x"), "{id}");
+                ids.push(object_id(id));
+            }
+            let pk: [u8; 96] = hex::decode(key_server_pk).unwrap().try_into().unwrap();
+            G2Element::from_byte_array(&pk).expect("on G2");
+            assert_eq!(n_shards.get(), 1000);
+        }
+        ids.sort_by_key(|id| id.into_inner());
+        ids.dedup();
+        assert_eq!(ids.len(), 6, "no ID is shared or repeated");
+        assert_ne!(testnet::SEAL_KEY_SERVER_PK, mainnet::SEAL_KEY_SERVER_PK);
+    }
+
+    #[cfg(not(feature = "mainnet"))]
+    #[test]
+    fn the_default_build_pins_testnet() {
+        assert_eq!(
+            RECORDING_MASTER_ACCESS_PACKAGE,
+            testnet::RECORDING_MASTER_ACCESS_PACKAGE
+        );
+        assert_eq!(AUDIO_VERIFIER_POLICY, testnet::AUDIO_VERIFIER_POLICY);
+        assert_eq!(SEAL_KEY_SERVER, testnet::SEAL_KEY_SERVER);
+        assert_eq!(SEAL_KEY_SERVER_PK, testnet::SEAL_KEY_SERVER_PK);
+    }
+
+    #[cfg(feature = "mainnet")]
+    #[test]
+    fn the_mainnet_build_pins_mainnet() {
+        assert_eq!(
+            RECORDING_MASTER_ACCESS_PACKAGE,
+            mainnet::RECORDING_MASTER_ACCESS_PACKAGE
+        );
+        assert_eq!(AUDIO_VERIFIER_POLICY, mainnet::AUDIO_VERIFIER_POLICY);
+        assert_eq!(SEAL_KEY_SERVER, mainnet::SEAL_KEY_SERVER);
+        assert_eq!(SEAL_KEY_SERVER_PK, mainnet::SEAL_KEY_SERVER_PK);
     }
 
     /// `seal_identity` of the Move package's `vectors.json`.

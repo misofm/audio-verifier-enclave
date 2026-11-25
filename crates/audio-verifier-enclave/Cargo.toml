@@ -8,6 +8,11 @@ license.workspace = true
 publish.workspace = true
 repository.workspace = true
 
+[features]
+# Pins mainnet's Seal policy package, upload policy, Walrus shard count and Seal key server
+# (`master::mainnet`) in place of testnet's (`master::testnet`).
+mainnet = []
+
 [dependencies]
 aes-gcm.workspace = true
 audio-verifier.workspace = true
