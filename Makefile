@@ -1,4 +1,13 @@
+# The pins compiled into the image: testnet into out/, mainnet (the crate's `mainnet` feature)
+# into out/mainnet/, so neither build overwrites the other's PCRs.
+NETWORK ?= testnet
+ifeq ($(NETWORK),testnet)
 OUT_DIR ?= out
+else ifeq ($(NETWORK),mainnet)
+OUT_DIR ?= out/mainnet
+else
+$(error NETWORK must be testnet or mainnet, not $(NETWORK))
+endif
 ENCLAVE_CID ?= 16
 ENCLAVE_CPUS ?= 4
 ENCLAVE_MEMORY ?= 6144M
@@ -25,6 +34,7 @@ $(OUT_DIR)/nitro.eif: $(EIF_INPUTS) | $(OUT_DIR)
 		--progress=plain \
 		--platform linux/amd64 \
 		--provenance=false \
+		--build-arg NETWORK=$(NETWORK) \
 		--output type=local,rewrite-timestamp=true,dest=$(OUT_DIR) \
 		-f Containerfile.eif \
 		.

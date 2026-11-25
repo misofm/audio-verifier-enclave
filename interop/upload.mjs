@@ -5,6 +5,8 @@
 //
 //   node interop/upload.mjs <sdk checkout> <flac> [enclave URL, http://127.0.0.1:3000]
 //
+// with NETWORK=mainnet against a dev server built with `--features mainnet`; testnet by default.
+//
 // The dev server's key is not registered on chain, so the chain check (`AudioVerifier.uploadKey`)
 // is not run here; its signature check is.
 
@@ -20,7 +22,13 @@ const sdk = await import(pathToFileURL(join(sdkDir, 'dist/index.js')).href);
 const { Effect } = await import(pathToFileURL(join(sdkDir, 'node_modules/effect/dist/index.js')).href);
 const { blake3 } = await import(pathToFileURL(join(sdkDir, 'node_modules/@noble/hashes/blake3.js')).href);
 
-const POLICY = '0xeb9fdb274f4edbda86b322cbb876a4f92aa6b9e58964d6d5953ff0cead49160e';
+const POLICIES = {
+  testnet: '0xeb9fdb274f4edbda86b322cbb876a4f92aa6b9e58964d6d5953ff0cead49160e',
+  mainnet: '0x7d5d2a995a4b243c408c3cf09f8f037211161494c3636f668696c844031fda1e',
+};
+const NETWORK = process.env.NETWORK || 'testnet';
+if (!Object.hasOwn(POLICIES, NETWORK)) throw new Error(`NETWORK must be testnet or mainnet, not ${NETWORK}`);
+const POLICY = POLICIES[NETWORK];
 const RECORDING = '0x' + 'c0'.repeat(32);
 const file = new Uint8Array(readFileSync(flacPath));
 const fileBlake3 = Buffer.from(blake3(file)).toString('hex');

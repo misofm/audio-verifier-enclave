@@ -1,6 +1,7 @@
 // Checks the enclave's output with the browser's code: app-v2's `src/posts/tink.ts` decrypts the
 // ciphertexts, and app-v2's `@mysten/seal` parses the sealed DEK and loads the pinned key server
-// from testnet. Usage: node interop/check.mjs <app-v2 checkout> <out-dir> <flac> <recording-id>
+// from the network. Usage: node interop/check.mjs <app-v2 checkout> <out-dir> <flac> <recording-id>
+// with NETWORK=mainnet for output of the mainnet pins (`--features mainnet`); testnet by default.
 //
 // tink.ts is the app's file with one change: its segment size, 65,536 bytes for posts, is set
 // to 1,048,576 (`AES256_GCM_HKDF_1MB`). The script refuses a tink.ts that does not declare it
@@ -20,12 +21,27 @@ const read = (name) => readFileSync(join(outDir, name));
 const requireApp = createRequire(join(appDir, 'package.json'));
 const load = (name) => import(pathToFileURL(requireApp.resolve(name)).href);
 
-const SEAL_PACKAGE = '0xc370c70e65b1aa16f429b90dc1ee7080fb4090ddb1b3c914adc32b8b430f0270';
-const KEY_SERVER = '0xb012378c9f3799fb5b1a7083da74a4069e3c3f1c93de0b27212a5799ce1e1e98';
-const AGGREGATOR = 'https://seal-aggregator-testnet.mystenlabs.com';
-const PINNED_PK =
-  'b8068e916e76791ec188624be83cabe2563719ed991a9732e54e8a04271037bc5f3b35356b2f9e22b3f5aa84856800f2' +
-  '19bc7472422ffcaced0c921f43b4f192662deb294c0639dbf0e2d00ade5483bcae7c70b25f9c8a1d3d21130ce441febe';
+const NETWORKS = {
+  testnet: {
+    SEAL_PACKAGE: '0xc370c70e65b1aa16f429b90dc1ee7080fb4090ddb1b3c914adc32b8b430f0270',
+    KEY_SERVER: '0xb012378c9f3799fb5b1a7083da74a4069e3c3f1c93de0b27212a5799ce1e1e98',
+    AGGREGATOR: 'https://seal-aggregator-testnet.mystenlabs.com',
+    PINNED_PK:
+      'b8068e916e76791ec188624be83cabe2563719ed991a9732e54e8a04271037bc5f3b35356b2f9e22b3f5aa84856800f2' +
+      '19bc7472422ffcaced0c921f43b4f192662deb294c0639dbf0e2d00ade5483bcae7c70b25f9c8a1d3d21130ce441febe',
+  },
+  mainnet: {
+    SEAL_PACKAGE: '0xe0262111397c8bfbef7ec8b785e249ce6b4eaf03c63cc4caf11b99fb38ebc0ec',
+    KEY_SERVER: '0x686098f1439237fff9f36b99c7329683c22979d2005c2465cb891acb012a7595',
+    AGGREGATOR: 'https://seal-aggregator-mainnet.mystenlabs.com',
+    PINNED_PK:
+      'aa2bc42ff27451d38d83f491d05ca200b20a0bf5704e48c4b02fdd4d33397556b4e3e8a2467cd129b469ae314879dee8' +
+      '17a804590d4aeca548124da68cc8f4d90cc3fdacc3b30936a393938eb4bb2315e91b0dc8ab704ceae22c314c6ef91198',
+  },
+};
+const NETWORK = process.env.NETWORK || 'testnet';
+if (!Object.hasOwn(NETWORKS, NETWORK)) throw new Error(`NETWORK must be testnet or mainnet, not ${NETWORK}`);
+const { SEAL_PACKAGE, KEY_SERVER, AGGREGATOR, PINNED_PK } = NETWORKS[NETWORK];
 
 // 1. Tink: app-v2's tink.ts at 1 MiB segments.
 const source = readFileSync(join(appDir, 'src/posts/tink.ts'), 'utf8');
@@ -76,13 +92,13 @@ console.log(`@mysten/seal: package ${sealed.packageId}, identity ${sealed.id}, s
 // The u256 decimal is the same number as the base64url bytes read little-endian.
 assert.equal(BigInt('0x' + Buffer.from(blobIdBytes).reverse().toString('hex')).toString(), response.audio.blob_id_u256);
 
-// 3. The key server, from testnet through @mysten/seal: the pinned key is its key.
-const suiClient = new SuiGrpcClient({ network: 'testnet', baseUrl: 'https://fullnode.testnet.sui.io:443' });
+// 3. The key server, from the network through @mysten/seal: the pinned key is its key.
+const suiClient = new SuiGrpcClient({ network: NETWORK, baseUrl: `https://fullnode.${NETWORK}.sui.io:443` });
 const client = new SealClient({ suiClient, serverConfigs: [{ objectId: KEY_SERVER, weight: 1, aggregatorUrl: AGGREGATOR }], verifyKeyServers: false });
 const servers = await client.getKeyServers();
 const server = servers.get(KEY_SERVER);
 assert.equal(toHex(server.pk), PINNED_PK);
-console.log(`@mysten/seal: testnet key server ${server.name} (${server.serverType}) has the pinned key`);
+console.log(`@mysten/seal: ${NETWORK} key server ${server.name} (${server.serverType}) has the pinned key`);
 // And the SDK's own encryption to it has the enclave's shape.
 const own = await client.encrypt({ threshold: 1, packageId: SEAL_PACKAGE, id: identity, data: new Uint8Array(32) });
 const parsed = EncryptedObject.parse(own.encryptedObject);

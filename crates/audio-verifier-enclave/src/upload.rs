@@ -36,7 +36,11 @@ use rand::{RngCore as _, rngs::OsRng};
 use serde::{Deserialize, Serialize};
 use tokio::{sync::mpsc, time::timeout};
 
-use crate::{MAX_FILE_BYTES, Service, measure, refuse, refuse_status};
+use crate::{
+    MAX_FILE_BYTES, Service,
+    master::{AUDIO_VERIFIER_POLICY, testnet},
+    measure, refuse, refuse_status,
+};
 
 /// Intent of the signed `IntentMessage<UploadKeyPayload>`: the enclave's upload key. Intents 0
 /// and 2 are the measurement's; 1 is retired.
@@ -44,11 +48,6 @@ pub const UPLOAD_KEY_INTENT: Intent = Intent(3);
 
 /// The protocol's label: the signed key's `context`, and the start of every HPKE `info`.
 pub const UPLOAD_PROTOCOL: &str = "miso-master-upload-v1";
-
-/// The on-chain `EnclavePolicy<AUDIO_VERIFIER>` on testnet, named in every HPKE `info`: the
-/// policy a client checked the upload key against.
-pub const AUDIO_VERIFIER_POLICY: &str =
-    "0xeb9fdb274f4edbda86b322cbb876a4f92aa6b9e58964d6d5953ff0cead49160e";
 
 /// How long a signed upload key is offered for. The key itself lives as long as the boot.
 pub const UPLOAD_KEY_LIFETIME_MS: u64 = 10 * 60 * 1000;
@@ -186,6 +185,10 @@ pub fn policy_id() -> [u8; 32] {
     measure::object_id(AUDIO_VERIFIER_POLICY).expect("the pinned policy is an object ID")
 }
 
+/// The policy in `vectors/upload_hpke.json`'s `info`: testnet's, on either network, since the
+/// self-test checks HPKE and not the pin.
+pub const KNOWN_POLICY: &str = testnet::AUDIO_VERIFIER_POLICY;
+
 /// `vectors/upload_hpke.json`: an upload of `miso master` in two frames, which `@hpke/core`
 /// seals byte for byte as the enclave expects.
 const KNOWN_ENC: &str = "e3b9708aaa21a7f1e62a95ee28d1e5d60b0fceed6c68599013a54b318e9e0b15";
@@ -208,7 +211,8 @@ pub fn self_test() -> Result<(), &'static str> {
     let key = UploadKey::from_ikm(&[0x11; 32]);
     let enc = hex::decode(KNOWN_ENC).map_err(|_| failed)?;
     let enc = <Kem as hpke::Kem>::EncappedKey::from_bytes(&enc).map_err(|_| failed)?;
-    let info = upload_info(&policy_id(), &[0xc0; 32], 11, 1_750_000_600_000);
+    let policy = measure::object_id(KNOWN_POLICY).map_err(|_| failed)?;
+    let info = upload_info(&policy, &[0xc0; 32], 11, 1_750_000_600_000);
     let mut receiver = hpke::setup_receiver::<AesGcm256, HkdfSha256, Kem>(
         &OpModeR::Base,
         &key.secret,

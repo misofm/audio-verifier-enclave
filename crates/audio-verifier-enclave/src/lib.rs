@@ -458,6 +458,12 @@ mod tests {
 
     const MIB: u64 = 1 << 20;
 
+    /// The checks the image runs before it serves, with the pins this build selects.
+    #[test]
+    fn the_boot_self_test_passes() {
+        assert_eq!(self_test(), Ok(()));
+    }
+
     #[test]
     fn jobs_follow_the_vcpus_unless_memory_is_short() {
         assert_eq!(measure_jobs(2, Some(1900 * MIB)), 2);

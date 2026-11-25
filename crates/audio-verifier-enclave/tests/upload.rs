@@ -8,8 +8,8 @@ use audio_verifier_enclave::{
     master::MASTER_ASSOCIATED_DATA,
     tink,
     upload::{
-        UPLOAD_KEY_LIFETIME_MS, UploadKeyPayload, frame_aad, policy_id, records, sign_upload_key,
-        upload_info,
+        KNOWN_POLICY, UPLOAD_KEY_LIFETIME_MS, UploadKeyPayload, frame_aad, policy_id, records,
+        sign_upload_key, upload_info,
     },
 };
 use axum::{
@@ -113,9 +113,10 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-/// An HPKE sender to `public` for an upload of `file_size` bytes to `recording`, and its start
-/// record.
+/// An HPKE sender to `public` for an upload of `file_size` bytes to `recording` under `policy`,
+/// and its start record.
 fn sender(
+    policy: &[u8; 32],
     public: &[u8; 32],
     recording: &[u8; 32],
     file_size: u64,
@@ -123,7 +124,7 @@ fn sender(
     rng: &mut Rng,
 ) -> (Vec<u8>, Sender) {
     let pk = <Kem as hpke::Kem>::PublicKey::from_bytes(public).expect("X25519 key");
-    let info = upload_info(&policy_id(), recording, file_size, expires_ms);
+    let info = upload_info(policy, recording, file_size, expires_ms);
     let (enc, sender) =
         hpke::setup_sender::<AesGcm256, HkdfSha256, Kem, _>(&OpModeS::Base, &pk, &info, rng)
             .expect("sender");
@@ -152,7 +153,14 @@ fn upload(
 ) -> (Vec<u8>, Vec<Vec<u8>>) {
     let mut rng = Rng::Seeded(Box::new(StdRng::seed_from_u64(3)));
     let expires = now_ms() + 60_000;
-    let (start, mut sender) = sender(public, recording, file.len() as u64, expires, &mut rng);
+    let (start, mut sender) = sender(
+        &policy_id(),
+        public,
+        recording,
+        file.len() as u64,
+        expires,
+        &mut rng,
+    );
     let mut frames = Vec::new();
     for (index, part) in file.chunks(chunk).enumerate() {
         let offset = (index * chunk) as u64;
@@ -323,7 +331,14 @@ async fn tampered_uploads_are_refused() {
     // A middle frame marked as the last.
     let mut rng = Rng::Seeded(Box::new(StdRng::seed_from_u64(4)));
     let expires = now_ms() + 60_000;
-    let (early_start, mut s) = sender(&public, &RECORDING_ID, file.len() as u64, expires, &mut rng);
+    let (early_start, mut s) = sender(
+        &policy_id(),
+        &public,
+        &RECORDING_ID,
+        file.len() as u64,
+        expires,
+        &mut rng,
+    );
     let early: Vec<Vec<u8>> = file
         .chunks(4096)
         .enumerate()
@@ -381,7 +396,14 @@ async fn an_expired_or_unknown_key_expiry_is_refused() {
         ),
     ] {
         let mut rng = Rng::Seeded(Box::new(StdRng::seed_from_u64(6)));
-        let (start, mut s) = sender(&public, &RECORDING_ID, file.len() as u64, expires, &mut rng);
+        let (start, mut s) = sender(
+            &policy_id(),
+            &public,
+            &RECORDING_ID,
+            file.len() as u64,
+            expires,
+            &mut rng,
+        );
         let frames = vec![frame(&mut s, 0, &file, true)];
         let (status, value, _) = post(&router, &start, &frames).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
@@ -493,7 +515,12 @@ fn the_upload_vectors_are_committed() {
     let file_size = 11u64;
     let expires_ms = TIMESTAMP_MS + UPLOAD_KEY_LIFETIME_MS;
     let mut rng = Rng::Fixed(ephemeral);
+    let policy: [u8; 32] = hex::decode(KNOWN_POLICY.trim_start_matches("0x"))
+        .unwrap()
+        .try_into()
+        .unwrap();
     let (start, mut s) = sender(
+        &policy,
         &key.public_key(),
         &RECORDING_ID,
         file_size,
@@ -519,16 +546,11 @@ fn the_upload_vectors_are_committed() {
             x25519_ikm: hex::encode(ikm),
             x25519_public_key: hex::encode(key.public_key()),
             ephemeral_ikm: hex::encode(ephemeral),
-            policy: hex::encode(policy_id()),
+            policy: hex::encode(policy),
             recording_id: hex::encode(RECORDING_ID),
             file_size: file_size.to_string(),
             key_expires_ms: expires_ms.to_string(),
-            info_hex: hex::encode(upload_info(
-                &policy_id(),
-                &RECORDING_ID,
-                file_size,
-                expires_ms,
-            )),
+            info_hex: hex::encode(upload_info(&policy, &RECORDING_ID, file_size, expires_ms)),
             enc: start["enc"].as_str().unwrap().into(),
             frames,
         },
