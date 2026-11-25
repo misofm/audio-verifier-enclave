@@ -32,11 +32,12 @@ const NETWORKS = {
   },
   mainnet: {
     SEAL_PACKAGE: '0xe0262111397c8bfbef7ec8b785e249ce6b4eaf03c63cc4caf11b99fb38ebc0ec',
-    KEY_SERVER: '0x686098f1439237fff9f36b99c7329683c22979d2005c2465cb891acb012a7595',
-    AGGREGATOR: 'https://seal-aggregator-mainnet.mystenlabs.com',
+    KEY_SERVER: '0xe0eb52eba9261b96e895bbb4deca10dcd64fbc626a1133017adcd5131353fd10',
+    // An independent server: no aggregator, the SDK uses the URL on its KeyServer object.
+    AGGREGATOR: undefined,
     PINNED_PK:
-      'aa2bc42ff27451d38d83f491d05ca200b20a0bf5704e48c4b02fdd4d33397556b4e3e8a2467cd129b469ae314879dee8' +
-      '17a804590d4aeca548124da68cc8f4d90cc3fdacc3b30936a393938eb4bb2315e91b0dc8ab704ceae22c314c6ef91198',
+      '90cd21cb4b5e866c22f6891ce31bb5cd791d7954dce76fa6ac91a70a884a9297dd89bbba33d10340eff20d1b26ae1175' +
+      '04c86793c7516feb9e0026d934d853ca3841ff7922dc7e361cfa7e4a301ed45ed62a775af6ea8e27fedac81773337ee3',
   },
 };
 const NETWORK = process.env.NETWORK || 'testnet';
@@ -94,7 +95,7 @@ assert.equal(BigInt('0x' + Buffer.from(blobIdBytes).reverse().toString('hex')).t
 
 // 3. The key server, from the network through @mysten/seal: the pinned key is its key.
 const suiClient = new SuiGrpcClient({ network: NETWORK, baseUrl: `https://fullnode.${NETWORK}.sui.io:443` });
-const client = new SealClient({ suiClient, serverConfigs: [{ objectId: KEY_SERVER, weight: 1, aggregatorUrl: AGGREGATOR }], verifyKeyServers: false });
+const client = new SealClient({ suiClient, serverConfigs: [{ objectId: KEY_SERVER, weight: 1, ...(AGGREGATOR ? { aggregatorUrl: AGGREGATOR } : {}) }], verifyKeyServers: false });
 const servers = await client.getKeyServers();
 const server = servers.get(KEY_SERVER);
 assert.equal(toHex(server.pk), PINNED_PK);

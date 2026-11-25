@@ -118,7 +118,7 @@ An upload is not resumed. The measurement, the encryption under the DEK and the 
 | Encryption | Tink streaming AEAD `AES256_GCM_HKDF_1MB` (`AesGcmHkdfStreaming`, 1,048,576-byte ciphertext segments, HKDF-SHA256, 32-byte derived keys), the wire format byte for byte. The DEK is 32 random bytes from the kernel, and is Tink's raw key value. The associated data is empty. |
 | Blob ID | walrus-core at `testnet-v1.60.2` (`29c3d1a`, also `mainnet-v1.60.2`), `EncodingType::RS2` at the network's shard count, 1,000 on both |
 | Seal | `crypto` from MystenLabs/seal at `seal-v0.6.16` (`54eff6a`): the DEK is the AES-256-GCM plaintext of an `EncryptedObject`, with empty associated data, as `@mysten/seal`'s `encrypt` makes by default |
-| Key server | The network's decentralized Seal key server, a committee behind one key, threshold 1, its `KeyServerV2` public key pinned |
+| Key server | The network's pinned Seal key server, threshold 1, its public key pinned: testnet's decentralized committee (one key), mainnet's Studio Mirai open-mode server |
 | Policy | The network's `recording_master_access` |
 | Identity | `bcs(recording_id: address) ‖ bcs(blob_id: u256)`, 64 bytes: the Recording's object ID, then the blob ID's 32 bytes, which are Walrus's raw blob ID bytes and the little-endian `u256` |
 
@@ -129,8 +129,8 @@ An upload is not resumed. The measurement, the encryption under the DEK and the 
 | `recording_master_access` (`RECORDING_MASTER_ACCESS_PACKAGE`) | `0xc370c70e65b1aa16f429b90dc1ee7080fb4090ddb1b3c914adc32b8b430f0270` | `0xe0262111397c8bfbef7ec8b785e249ce6b4eaf03c63cc4caf11b99fb38ebc0ec` |
 | `EnclavePolicy<AUDIO_VERIFIER>` (`AUDIO_VERIFIER_POLICY`) | `0xeb9fdb274f4edbda86b322cbb876a4f92aa6b9e58964d6d5953ff0cead49160e` | `0x7d5d2a995a4b243c408c3cf09f8f037211161494c3636f668696c844031fda1e` |
 | Walrus shards (`WALRUS_N_SHARDS`) | 1,000 (system object `0x6c2547cb…f6af`, epoch 585) | 1,000 (system object `0x2134d527…ddd2`, epoch 44) |
-| Seal key server (`SEAL_KEY_SERVER`) | `0xb012378c9f3799fb5b1a7083da74a4069e3c3f1c93de0b27212a5799ce1e1e98`, 3-of-5 | `0x686098f1439237fff9f36b99c7329683c22979d2005c2465cb891acb012a7595`, 5-of-8 |
-| Its public key (`SEAL_KEY_SERVER_PK`) | `b8068e91…41febe` | `aa2bc42f…f91198` |
+| Seal key server (`SEAL_KEY_SERVER`) | `0xb012378c9f3799fb5b1a7083da74a4069e3c3f1c93de0b27212a5799ce1e1e98`, 3-of-5 | `0xe0eb52eba9261b96e895bbb4deca10dcd64fbc626a1133017adcd5131353fd10`, Studio Mirai's open-mode server (`https://open.key-server.mainnet.seal.mirai.cloud`) |
+| Its public key (`SEAL_KEY_SERVER_PK`) | `b8068e91…41febe` | `90cd21cb…337ee3` |
 | Threshold (`SEAL_THRESHOLD`) | 1 | 1 |
 
 The pins are constants in [`crates/audio-verifier-enclave/src/master.rs`](crates/audio-verifier-enclave/src/master.rs), `master::testnet` and `master::mainnet`. A build compiles in one set, testnet's unless the crate's `mainnet` feature is on, so the pins are part of the image and its PCRs, and each network's image has its own; changing one is a new image, registered again. At boot the service checks the decoder, a Tink known answer, an HPKE upload and a Walrus blob ID against recorded answers, and parses the pinned key, and refuses to start if any fails.

@@ -68,15 +68,15 @@ pub mod mainnet {
     /// November 2026).
     pub const WALRUS_N_SHARDS: NonZeroU16 = NonZeroU16::new(1000).unwrap();
 
-    /// Seal's decentralized mainnet key server: one `KeyServer` object whose key a 5-of-8
-    /// committee holds in shares, so a threshold of 1 asks it once.
+    /// Studio Mirai's open-mode mainnet key server (`studio-mirai-open`,
+    /// https://open.key-server.mainnet.seal.mirai.cloud), one independent server: threshold 1.
     pub const SEAL_KEY_SERVER: &str =
-        "0x686098f1439237fff9f36b99c7329683c22979d2005c2465cb891acb012a7595";
+        "0xe0eb52eba9261b96e895bbb4deca10dcd64fbc626a1133017adcd5131353fd10";
 
-    /// That key server's BLS12-381 G2 public key, `KeyServerV2.pk` (version 2).
-    pub const SEAL_KEY_SERVER_PK: &str = "aa2bc42ff27451d38d83f491d05ca200b20a0bf5704e48c4b02fdd\
-        4d33397556b4e3e8a2467cd129b469ae314879dee817a804590d4aeca548124da68cc8f4d90cc3fdacc3b30\
-        936a393938eb4bb2315e91b0dc8ab704ceae22c314c6ef91198";
+    /// That key server's BLS12-381 G2 public key, `KeyServerV1.pk`.
+    pub const SEAL_KEY_SERVER_PK: &str = "90cd21cb4b5e866c22f6891ce31bb5cd791d7954dce76fa6ac91a70a\
+        884a9297dd89bbba33d10340eff20d1b26ae117504c86793c7516feb9e0026d934d853ca3841ff7922dc7e36\
+        1cfa7e4a301ed45ed62a775af6ea8e27fedac81773337ee3";
 }
 
 /// Walrus's encoding type, RedStuff over Reed-Solomon, walrus-core's `DEFAULT_ENCODING`.
